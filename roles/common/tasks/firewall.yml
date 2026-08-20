@@ -1,0 +1,115 @@
+---
+# ============================================================================
+#  firewall_action:
+#     open    - punch exactly the holes Kubernetes + the chosen CNI need
+#     disable - stop and disable the host firewall outright (lab shortcut)
+#     ignore  - handled by the caller, this file is not included
+# ============================================================================
+
+- name: common | firewall | Detect ufw
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: _ufw_bin
+
+- name: common | firewall | Detect firewalld
+  ansible.builtin.command: systemctl is-active firewalld
+  register: _firewalld
+  changed_when: false
+  failed_when: false
+
+- name: common | firewall | Report what will be opened
+  when: firewall_action == 'open'
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: opening
+      {{ firewall_ports | map(attribute='port') | zip(firewall_ports | map(attribute='proto'))
+         | map('join', '/') | join(', ') }}
+
+# ───────────────────────────────── ufw ─────────────────────────────────────
+- name: common | firewall | Check if ufw is active
+  when: _ufw_bin.stat.exists
+  ansible.builtin.command: ufw status
+  register: _ufw_status
+  changed_when: false
+  failed_when: false
+
+- name: common | firewall | Open ports in ufw
+  when:
+    - firewall_action == 'open'
+    - _ufw_bin.stat.exists
+    - "'Status: active' in (_ufw_status.stdout | default(''))"
+  ansible.builtin.command: >-
+    ufw allow proto {{ item.proto }} to any port {{ item.port | replace('-', ':') }}
+    comment "k8s: {{ item.why }}"
+  register: _ufw_add
+  changed_when: "'Rule added' in (_ufw_add.stdout | default(''))"
+  loop: "{{ firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }} ({{ item.why }})"
+
+- name: common | firewall | Allow pod and service CIDRs through ufw
+  when:
+    - firewall_action == 'open'
+    - _ufw_bin.stat.exists
+    - "'Status: active' in (_ufw_status.stdout | default(''))"
+  ansible.builtin.command: 'ufw allow from {{ item }} comment "k8s: cluster CIDR"'
+  register: _ufw_cidr
+  changed_when: "'Rule added' in (_ufw_cidr.stdout | default(''))"
+  loop:
+    - "{{ pod_cidr }}"
+    - "{{ service_cidr }}"
+
+- name: common | firewall | Disable ufw
+  when:
+    - firewall_action == 'disable'
+    - _ufw_bin.stat.exists
+  ansible.builtin.command: ufw --force disable
+  register: _ufw_off
+  changed_when: "'disabled' in (_ufw_off.stdout | default(''))"
+
+# ─────────────────────────────── firewalld ─────────────────────────────────
+- name: common | firewall | Open ports in firewalld
+  when:
+    - firewall_action == 'open'
+    - _firewalld.stdout | default('') | trim == 'active'
+  ansible.builtin.command: >-
+    firewall-cmd --permanent --add-port={{ item.port }}/{{ item.proto }}
+  register: _fwd_add
+  changed_when: "'ALREADY_ENABLED' not in (_fwd_add.stderr | default('') + _fwd_add.stdout | default(''))"
+  loop: "{{ firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }} ({{ item.why }})"
+  notify: reload firewalld
+
+# Pod-to-pod traffic is masqueraded out of the node; without this the CNI
+# overlay silently drops return traffic on RHEL/Rocky.
+- name: common | firewall | Trust the pod and service CIDRs in firewalld
+  when:
+    - firewall_action == 'open'
+    - _firewalld.stdout | default('') | trim == 'active'
+  ansible.builtin.command: >-
+    firewall-cmd --permanent --zone=trusted --add-source={{ item }}
+  register: _fwd_src
+  changed_when: "'ALREADY_ENABLED' not in (_fwd_src.stderr | default('') + _fwd_src.stdout | default(''))"
+  loop:
+    - "{{ pod_cidr }}"
+    - "{{ service_cidr }}"
+  notify: reload firewalld
+
+- name: common | firewall | Enable masquerade in firewalld
+  when:
+    - firewall_action == 'open'
+    - _firewalld.stdout | default('') | trim == 'active'
+  ansible.builtin.command: firewall-cmd --permanent --add-masquerade
+  register: _fwd_masq
+  changed_when: "'ALREADY_ENABLED' not in (_fwd_masq.stderr | default('') + _fwd_masq.stdout | default(''))"
+  notify: reload firewalld
+
+- name: common | firewall | Disable firewalld
+  when:
+    - firewall_action == 'disable'
+    - _firewalld.stdout | default('') | trim == 'active'
+  ansible.builtin.systemd_service:
+    name: firewalld
+    state: stopped
+    enabled: false

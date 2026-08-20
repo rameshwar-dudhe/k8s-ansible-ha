@@ -1,0 +1,42 @@
+---
+# Runs only on the primary control plane — these are cluster-wide resources.
+
+- name: cni | Set the kubeconfig used for all kubectl calls
+  ansible.builtin.set_fact:
+    _kubectl: "kubectl --kubeconfig /etc/kubernetes/admin.conf"
+
+- name: cni | Check whether a CNI is already installed
+  ansible.builtin.shell:
+    cmd: >-
+      {{ _kubectl }} get pods -A -o name 2>/dev/null
+      | grep -E 'calico|cilium|weave' | head -1
+  register: _cni_present
+  changed_when: false
+  failed_when: false
+
+- name: cni | Install {{ cni }}
+  ansible.builtin.include_tasks: "{{ cni }}.yml"
+
+- name: cni | Wait for all nodes to report Ready
+  ansible.builtin.shell:
+    cmd: >-
+      {{ _kubectl }} get nodes
+      -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+  register: _nodes_ready
+  retries: 40
+  delay: 10
+  until:
+    - _nodes_ready.rc == 0
+    - _nodes_ready.stdout_lines | length > 0
+    - _nodes_ready.stdout_lines | reject('equalto', 'True') | list | length == 0
+  changed_when: false
+
+- name: cni | Report cluster state
+  ansible.builtin.shell:
+    cmd: "{{ _kubectl }} get nodes -o wide && echo '---' && {{ _kubectl }} get pods -A"
+  register: _final
+  changed_when: false
+
+- name: cni | Cluster status
+  ansible.builtin.debug:
+    msg: "{{ _final.stdout_lines }}"

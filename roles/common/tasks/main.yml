@@ -1,0 +1,247 @@
+---
+- name: common | Assert the OS is supported
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.os_family in ['Debian', 'RedHat']
+    fail_msg: >-
+      Unsupported OS: {{ ansible_facts.distribution }}
+      {{ ansible_facts.distribution_version }}.
+      This repo supports Ubuntu (Debian family) and RHEL / Rocky (RedHat family).
+    success_msg: >-
+      Detected {{ ansible_facts.distribution }}
+      {{ ansible_facts.distribution_version }} ({{ ansible_facts.os_family }} family)
+    quiet: true
+
+- name: common | Assert the CNI / CRI / kube-proxy combination is valid
+  run_once: true
+  ansible.builtin.assert:
+    that:
+      - cri in ['containerd', 'crio']
+      - cni in ['calico', 'cilium', 'weavenet']
+      - kube_proxy_mode in ['nftables', 'iptables', 'ipvs', 'none']
+      - not (kube_proxy_mode == 'none' and cni != 'cilium')
+    fail_msg: >-
+      Invalid combination — cri={{ cri }} cni={{ cni }}
+      kube_proxy_mode={{ kube_proxy_mode }}.
+      Valid kube_proxy_mode: nftables, iptables, ipvs, none.
+      kube_proxy_mode=none is only supported with cni=cilium.
+    quiet: true
+
+- name: common | Warn that IPVS proxy mode is deprecated
+  when: kube_proxy_mode == 'ipvs'
+  run_once: true
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: kube_proxy_mode=ipvs is DEPRECATED as of Kubernetes v1.35."
+      - "kube-proxy logs a deprecation warning on startup; the mode is disabled"
+      - "by default from v1.40 and removed entirely in v1.43."
+      - "Upstream recommends nftables (stable since v1.33) for Linux nodes."
+      - "Switch with: -e kube_proxy_mode=nftables"
+
+- name: common | Fix node_ip when the inventory did not set it
+  ansible.builtin.set_fact:
+    node_ip: "{{ node_ip | default(ansible_host) }}"
+
+- name: common | Warn loudly about Weave Net
+  when: cni == 'weavenet'
+  run_once: true
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: Weaveworks shut down and archived the original Weave Net project."
+      - "This role installs the community fork '{{ weavenet_repo }}' {{ weavenet_version }}."
+      - "It is NOT validated against Kubernetes {{ k8s_minor }} and may not converge."
+      - "Prefer cni=calico or cni=cilium for anything you care about."
+
+# ─────────────────────────────── Base packages ─────────────────────────────
+- name: common | Install base packages
+  ansible.builtin.include_tasks: "{{ ansible_facts.os_family }}.yml"
+
+# ─────────────────────────────────── Swap ──────────────────────────────────
+- name: common | Disable swap for the current boot
+  ansible.builtin.command: swapoff -a
+  changed_when: ansible_facts.swaptotal_mb | int > 0
+
+- name: common | Comment swap entries out of /etc/fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(?!#)(\s*\S+\s+\S+\s+swap\s+.*)$'
+    replace: '# \1   # disabled by k8s-ansible-ha'
+
+- name: common | Detect zram swap generator (Ubuntu 24.04+ ships this)
+  ansible.builtin.stat:
+    path: /usr/lib/systemd/system/systemd-zram-setup@.service
+  register: _zram
+
+- name: common | Mask the zram swap generator
+  when: _zram.stat.exists
+  ansible.builtin.systemd_service:
+    name: "systemd-zram-setup@zram0.service"
+    state: stopped
+    masked: true
+  failed_when: false
+
+# ────────────────────────────── Kernel plumbing ────────────────────────────
+- name: common | Persist required kernel modules
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    mode: "0644"
+    content: |
+      # Managed by k8s-ansible-ha
+      overlay
+      br_netfilter
+      {% if kube_proxy_mode == 'ipvs' %}
+      ip_vs
+      ip_vs_rr
+      ip_vs_wrr
+      ip_vs_sh
+      nf_conntrack
+      {% endif %}
+
+# Deliberately `command: modprobe` rather than community.general.modprobe --
+# this repo depends on ansible-core alone, no Galaxy collections required.
+- name: common | Load kernel modules now
+  ansible.builtin.command: "modprobe {{ item }}"
+  changed_when: false
+  loop: "{{ ['overlay', 'br_netfilter'] +
+            (['ip_vs', 'ip_vs_rr', 'ip_vs_wrr', 'ip_vs_sh', 'nf_conntrack']
+             if kube_proxy_mode == 'ipvs' else []) }}"
+
+# ============================================================================
+#  Packet forwarding.
+#
+#  Upstream ("Enable IPv4 packet forwarding", Container Runtimes page) requires
+#  exactly ONE setting for Kubernetes itself:
+#      net.ipv4.ip_forward = 1
+#  written to /etc/sysctl.d/k8s.conf and applied with `sysctl --system`.
+#
+#  The bridge-nf-call-* settings are NOT in that section any more — they are a
+#  CNI/bridge-plugin requirement (Calico and others still document them), which
+#  is why they are kept here but labelled as such.
+#
+#  IPv6 forwarding is NOT required for an IPv4-only cluster and upstream does
+#  not mandate it; it is enabled here so nodes are ready for dual-stack. See the
+#  accept_ra caveat below before turning it on for a node that relies on SLAAC.
+# ============================================================================
+- name: common | Apply Kubernetes sysctl settings
+  ansible.builtin.copy:
+    # 99- prefix so these win over any distro defaults (files are applied in
+    # lexical order). Upstream's example uses k8s.conf, which sorts earlier and
+    # could be overridden by a later file.
+    dest: /etc/sysctl.d/99-kubernetes.conf
+    mode: "0644"
+    content: |
+      # Managed by k8s-ansible-ha
+
+      # --- Required by Kubernetes (upstream: "Enable IPv4 packet forwarding")
+      net.ipv4.ip_forward                 = 1
+
+      # --- Required by CNI plugins that bridge traffic (needs br_netfilter)
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      {% if enable_ipv6_forwarding | bool %}
+
+      # --- IPv6 forwarding (optional; needed for dual-stack)
+      # CAUTION: with forwarding=1 the kernel ignores router advertisements on
+      # these interfaces unless accept_ra=2, so a node that gets its IPv6
+      # address via SLAAC can lose it. Harmless on IPv4-only nodes.
+      net.ipv6.conf.all.forwarding        = 1
+      net.ipv6.conf.default.forwarding    = 1
+      {% endif %}
+
+      # --- Headroom for kubelet/CNI file watches
+      fs.inotify.max_user_instances       = 8192
+      fs.inotify.max_user_watches         = 524288
+      {% if cni == 'cilium' %}
+
+      # --- Cilium needs reverse-path filtering relaxed on its interfaces
+      net.ipv4.conf.all.rp_filter         = 0
+      {% endif %}
+  notify: reload sysctl
+
+- name: common | Flush handlers so sysctl is live before anything else runs
+  ansible.builtin.meta: flush_handlers
+
+# Upstream tells you to verify with `sysctl net.ipv4.ip_forward` after applying.
+# Doing it as a real assertion means a silently-unapplied setting fails the run
+# here, instead of surfacing later as pods that cannot reach anything.
+- name: common | Verify packet forwarding is actually enabled
+  ansible.builtin.command: "sysctl -n {{ item }}"
+  register: _fwd_check
+  changed_when: false
+  loop: "{{ ['net.ipv4.ip_forward',
+             'net.bridge.bridge-nf-call-iptables',
+             'net.bridge.bridge-nf-call-ip6tables']
+            + (['net.ipv6.conf.all.forwarding']
+               if enable_ipv6_forwarding | bool else []) }}"
+
+- name: common | Assert every forwarding sysctl is set to 1
+  ansible.builtin.assert:
+    that:
+      - _fwd_check.results | rejectattr('stdout', 'equalto', '1') | list | length == 0
+    fail_msg: >-
+      Packet forwarding is not fully enabled on {{ inventory_hostname }}:
+      {{ _fwd_check.results
+         | rejectattr('stdout', 'equalto', '1')
+         | map(attribute='item') | join(', ') }}
+      — check for a conflicting file in /etc/sysctl.d/ that sorts after
+      99-kubernetes.conf.
+    success_msg: >-
+      Forwarding verified —
+      {{ _fwd_check.results | map(attribute='item') | join(', ') }} all = 1
+    quiet: true
+
+# ─────────────────────────── resolv.conf for kubelet ───────────────────────
+# On systemd-resolved hosts /etc/resolv.conf is a stub pointing at 127.0.0.53.
+# Handing that to CoreDNS makes it forward queries to itself -> resolution loop
+# and a CrashLoopBackOff. Point kubelet at the real upstream list instead.
+- name: common | Look for the systemd-resolved upstream resolv.conf
+  ansible.builtin.stat:
+    path: /run/systemd/resolve/resolv.conf
+  register: _resolved
+
+- name: common | Choose the resolv.conf kubelet should hand to CoreDNS
+  ansible.builtin.set_fact:
+    kubelet_resolv_conf: >-
+      {{ '/run/systemd/resolve/resolv.conf'
+         if _resolved.stat.exists else '/etc/resolv.conf' }}
+
+# ──────────────────────────────── Identity ─────────────────────────────────
+# Keep the machine's hostname equal to its inventory name. `kubeadm join` is
+# given --node-name explicitly, so the Kubernetes node object is correct either
+# way -- but a box whose prompt says k8s-cp-1 while the cluster calls it
+# k8s-w-0 is how the wrong node gets rebooted at 2am.
+- name: common | Set the system hostname to match the inventory name
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+# ──────────────────────────────── /etc/hosts ───────────────────────────────
+- name: common | Ensure this node's own hostname resolves
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^{{ node_ip | regex_escape }}\s'
+    line: "{{ node_ip }} {{ inventory_hostname }}"
+    state: present
+
+- name: common | Add every cluster peer to /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^{{ hostvars[item].node_ip | default(hostvars[item].ansible_host) | regex_escape }}\s'
+    line: >-
+      {{ hostvars[item].node_ip | default(hostvars[item].ansible_host) }}
+      {{ item }}
+    state: present
+  loop: "{{ groups['k8s_cluster'] | default([]) }}"
+  when: hostvars[item].ansible_host is defined
+
+- name: common | Add the kube-vip control-plane VIP to /etc/hosts
+  when: kubevip_enabled | bool
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^{{ kubevip_vip | regex_escape }}\s'
+    line: "{{ kubevip_vip }} {{ cluster_name }}-vip kubernetes"
+    state: present
+
+# ──────────────────────────────── Firewall ─────────────────────────────────
+- name: common | Configure the host firewall
+  when: firewall_action != 'ignore'
+  ansible.builtin.include_tasks: firewall.yml

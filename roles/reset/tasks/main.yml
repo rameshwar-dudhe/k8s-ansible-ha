@@ -1,0 +1,248 @@
+---
+# ============================================================================
+#  Tears a node back down to "packages installed, no cluster".
+#  Set `reset_purge_packages=true` to also remove kubeadm/kubelet/kubectl
+#  and the container runtime.
+# ============================================================================
+
+- name: reset | Announce
+  ansible.builtin.debug:
+    msg: >-
+      Resetting {{ inventory_hostname }} ({{ node_ip | default(ansible_host) }})
+      — purge_packages={{ reset_purge_packages | bool }}
+
+# Remove the static pod first, so kube-vip drops the VIP before the API server
+# it depends on goes away.
+- name: reset | Remove the kube-vip static pod manifest
+  ansible.builtin.file:
+    path: /etc/kubernetes/manifests/kube-vip.yaml
+    state: absent
+
+- name: reset | Release the VIP from the interface if it is still held
+  when: kubevip_enabled | bool
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      iface=$(ip -4 -o addr show | awk '$4 ~ /^{{ kubevip_vip }}\// {print $2; exit}')
+      if [ -n "$iface" ]; then
+        ip addr del {{ kubevip_vip }}/{{ kubevip_vip_subnet }} dev "$iface"
+        echo "released"
+      fi
+  register: _vip_release
+  changed_when: "'released' in (_vip_release.stdout | default(''))"
+  failed_when: false
+
+- name: reset | Check whether kubeadm has anything to reset
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: _kubelet_conf
+
+# The cluster may have been built with a different runtime than `cri` currently
+# says — e.g. built with `-e cri=crio` but torn down with the default. Passing
+# the wrong --cri-socket means kubeadm cannot stop or remove the running
+# containers, and the teardown leaves the node dirty. Ask kubelet what it is
+# actually using rather than trusting the variable.
+- name: reset | Detect the CRI socket the cluster was actually built with
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      sock=$(grep -o -- '--container-runtime-endpoint=[^ "]*' \
+              /var/lib/kubelet/kubeadm-flags.env 2>/dev/null \
+             | head -1 | cut -d= -f2-)
+      if [ -n "$sock" ]; then echo "$sock"; exit 0; fi
+      # Fall back to whichever runtime socket actually exists on disk.
+      for s in /run/crio/crio.sock /run/containerd/containerd.sock; do
+        [ -S "$s" ] && { echo "unix://$s"; exit 0; }
+      done
+      echo ""
+  register: _detected_sock
+  changed_when: false
+  failed_when: false
+
+- name: reset | Settle the CRI socket to use for the reset
+  ansible.builtin.set_fact:
+    _reset_cri_socket: >-
+      {{ (_detected_sock.stdout | trim)
+         if (_detected_sock.stdout | trim | length) > 0
+         else cri_socket }}
+
+- name: reset | Report the runtime being reset
+  ansible.builtin.debug:
+    msg: >-
+      Resetting with --cri-socket {{ _reset_cri_socket }}
+      {{ '(detected from kubelet)'
+         if (_detected_sock.stdout | trim | length) > 0
+         else '(fell back to cri=' ~ cri ~ ')' }}
+
+- name: reset | Run kubeadm reset
+  when: _kubelet_conf.stat.exists
+  ansible.builtin.command: >-
+    kubeadm reset -f --cri-socket {{ _reset_cri_socket }}
+  register: _reset
+  changed_when: true
+  failed_when: false
+
+- name: reset | Stop kubelet
+  ansible.builtin.systemd_service:
+    name: kubelet
+    state: stopped
+    enabled: false
+  failed_when: false
+
+# Calico mounts a cgroup2 filesystem at /var/run/calico/cgroup (used for
+# connect-time load balancing), and kubelet leaves per-pod tmpfs mounts under
+# /var/lib/kubelet. A mount point cannot be removed with rmtree -- the delete
+# fails with "Operation not permitted" and aborts the rest of the teardown.
+# Unmount everything under those trees first.
+- name: reset | Unmount filesystems under the paths about to be removed
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      found=0
+      # Reverse-sort so nested mounts are unmounted before their parents.
+      for mp in $(awk '{print $2}' /proc/mounts \
+                  | grep -E '^(/var)?/run/(calico|cilium)|^/var/lib/kubelet/' \
+                  | sort -r); do
+        umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+        found=1
+      done
+      [ "$found" -eq 1 ] && echo UNMOUNTED || echo NOTHING-MOUNTED
+  register: _reset_umount
+  changed_when: "'UNMOUNTED' in (_reset_umount.stdout | default(''))"
+  failed_when: false
+
+- name: reset | Remove cluster state directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  # Tolerate a stubborn mount rather than aborting the whole teardown: the
+  # remaining steps (interfaces, iptables, runtime restart) matter more.
+  register: _reset_rm
+  failed_when: false
+  loop:
+    - /etc/kubernetes
+    - /var/lib/etcd
+    - /var/lib/kubelet
+    - /var/lib/cni
+    - /var/lib/calico
+    - /var/run/calico
+    - /var/lib/cilium
+    - /var/run/cilium
+    - /var/lib/weave
+    - /etc/cni/net.d
+    - /opt/cni/bin/calico
+    - /opt/cni/bin/cilium-cni
+    - /root/.kube
+
+- name: reset | Report any directory that could not be removed
+  when: _reset_rm.results | default([]) | selectattr('failed', 'defined')
+        | selectattr('failed') | list | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      Could not remove:
+      {{ _reset_rm.results | selectattr('failed', 'defined') | selectattr('failed')
+         | map(attribute='item') | join(', ') }}
+      — check for a leftover mount with `mount | grep -E "calico|cilium|kubelet"`.
+
+- name: reset | Delete CNI virtual interfaces
+  ansible.builtin.shell:
+    cmd: |
+      # `ip -o link show` prints names as "calibe7a834de4c@if2" / "tunl0@NONE".
+      # The "@peer" suffix is display-only -- passing it to `ip link delete`
+      # is an invalid name and the delete silently does nothing. Strip it.
+      names() {
+        ip -o link show | awk -F': ' '{split($2, a, "@"); print a[1]}'
+      }
+      for i in cni0 flannel.1 weave datapath vxlan.calico vxlan-v6.calico \
+               tunl0 cilium_host cilium_net cilium_vxlan kube-ipvs0 nodelocaldns; do
+        ip link show "$i" >/dev/null 2>&1 && ip link delete "$i" 2>/dev/null || true
+      done
+      for i in $(names | grep -E '^(cali|lxc|veth[a-f0-9]{6})' || true); do
+        ip link delete "$i" 2>/dev/null || true
+      done
+      # Report anything that survived so the teardown does not look clean when
+      # it is not.
+      left=$(names | grep -E '^(cali|lxc|tunl0|cni0|weave|cilium_|vxlan\.calico|kube-ipvs0)' || true)
+      if [ -n "$left" ]; then
+        echo "REMAINING: $(echo "$left" | tr '\n' ' ')"
+      else
+        echo "cleaned"
+      fi
+  register: _links
+  changed_when: "'cleaned' in (_links.stdout | default(''))"
+  failed_when: false
+
+- name: reset | Warn about interfaces that could not be removed
+  when: "'REMAINING' in (_links.stdout | default(''))"
+  ansible.builtin.debug:
+    msg: >-
+      Some virtual interfaces survived the teardown: {{ _links.stdout | trim }}.
+      They are inert without a CNI running, but a reboot will clear them.
+
+- name: reset | Flush iptables and ipvs rules
+  ansible.builtin.shell:
+    cmd: |
+      for t in nat mangle filter raw; do
+        iptables  -t $t -F 2>/dev/null || true
+        iptables  -t $t -X 2>/dev/null || true
+        ip6tables -t $t -F 2>/dev/null || true
+        ip6tables -t $t -X 2>/dev/null || true
+      done
+      command -v ipvsadm >/dev/null 2>&1 && ipvsadm -C || true
+      command -v nft >/dev/null 2>&1 && nft flush ruleset || true
+      echo flushed
+  register: _ipt
+  changed_when: "'flushed' in (_ipt.stdout | default(''))"
+  failed_when: false
+
+- name: reset | Restart the container runtime to clear stale sandboxes
+  # Derived from the DETECTED socket, not the `cri` variable — same reason as
+  # the kubeadm reset above.
+  ansible.builtin.systemd_service:
+    name: "{{ 'crio' if 'crio' in _reset_cri_socket else 'containerd' }}"
+    state: restarted
+  failed_when: false
+
+# ─────────────────────────── Optional package purge ────────────────────────
+- name: reset | Purge Kubernetes and runtime packages
+  when: reset_purge_packages | bool
+  block:
+    - name: reset | Debian | Release apt holds
+      when: ansible_facts.os_family == 'Debian'
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop: [kubelet, kubeadm, kubectl]
+      failed_when: false
+
+    - name: reset | Debian | Remove packages
+      when: ansible_facts.os_family == 'Debian'
+      ansible.builtin.apt:
+        name: [kubelet, kubeadm, kubectl, kubernetes-cni, cri-tools, containerd.io, cri-o]
+        state: absent
+        purge: true
+        autoremove: true
+      failed_when: false
+
+    - name: reset | RedHat | Remove packages
+      when: ansible_facts.os_family == 'RedHat'
+      ansible.builtin.dnf:
+        name: [kubelet, kubeadm, kubectl, kubernetes-cni, cri-tools, containerd.io, cri-o]
+        state: absent
+        autoremove: true
+      failed_when: false
+
+    - name: reset | Remove leftover binaries and config
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/cni
+        - /etc/containerd
+        - /etc/crio
+        - /etc/crictl.yaml
+        - /usr/local/bin/cilium
+
+- name: reset | Done
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} reset to a clean state."

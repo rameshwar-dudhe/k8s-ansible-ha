@@ -1,0 +1,97 @@
+---
+# ============================================================================
+#  Calico via the Tigera operator.
+#
+#  NOTE: we deliberately do NOT use Calico's documented default pod CIDR of
+#  192.168.0.0/16 — it would swallow this lab's 192.168.56.0/24 host network
+#  (and the kube-vip VIP with it). pod_cidr is 10.244.0.0/16 in group_vars.
+# ============================================================================
+
+- name: cni | calico | Create the manifest directory
+  ansible.builtin.file:
+    path: /etc/kubernetes/cni
+    state: directory
+    mode: "0755"
+
+# IMPORTANT: as of Calico v3.32, tigera-operator.yaml contains ONLY the
+# operator Namespace/RBAC/Deployment -- the 32 CRDs were split out into
+# operator-crds.yaml. Applying just tigera-operator.yaml (as most older guides
+# still say) leaves the operator with no Installation CRD to reconcile and the
+# next step fails with:
+#   customresourcedefinitions "installations.operator.tigera.io" not found
+- name: cni | calico | Download the Tigera operator CRDs
+  ansible.builtin.get_url:
+    url: >-
+      https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/operator-crds.yaml
+    dest: /etc/kubernetes/cni/operator-crds.yaml
+    mode: "0644"
+
+- name: cni | calico | Download the Tigera operator manifest
+  ansible.builtin.get_url:
+    url: >-
+      https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+    dest: /etc/kubernetes/cni/tigera-operator.yaml
+    mode: "0644"
+
+# Server-side apply throughout: these CRDs are far too large for the 262 kB
+# last-applied-configuration annotation a client-side `kubectl apply` writes.
+- name: cni | calico | Apply the Tigera operator CRDs (server-side)
+  ansible.builtin.command: >-
+    {{ _kubectl }} apply --server-side --force-conflicts
+    -f /etc/kubernetes/cni/operator-crds.yaml
+  register: _tigera_crds
+  # kubectl server-side apply always prints "serverside-applied" -- it never
+  # emits "unchanged", so a no-op cannot be distinguished from a real change.
+  # Reporting not-changed keeps re-runs honest rather than permanently "changed".
+  changed_when: false
+
+- name: cni | calico | Apply the Tigera operator (server-side)
+  ansible.builtin.command: >-
+    {{ _kubectl }} apply --server-side --force-conflicts
+    -f /etc/kubernetes/cni/tigera-operator.yaml
+  register: _tigera
+  changed_when: false   # see note above: SSA cannot report a no-op
+
+- name: cni | calico | Wait for the Installation CRD to be established
+  ansible.builtin.command: >-
+    {{ _kubectl }} wait --for=condition=Established --timeout=180s
+    crd/installations.operator.tigera.io
+  changed_when: false
+
+- name: cni | calico | Wait for the operator deployment to be available
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n tigera-operator wait --for=condition=Available
+    --timeout=300s deployment/tigera-operator
+  changed_when: false
+
+- name: cni | calico | Render the Installation resource
+  ansible.builtin.template:
+    src: calico-installation.yaml.j2
+    dest: /etc/kubernetes/cni/calico-installation.yaml
+    mode: "0644"
+
+- name: cni | calico | Apply the Installation resource
+  ansible.builtin.command: >-
+    {{ _kubectl }} apply -f /etc/kubernetes/cni/calico-installation.yaml
+  register: _calico_inst
+  changed_when: "'unchanged' not in (_calico_inst.stdout | default(''))"
+
+- name: cni | calico | Wait for calico-node to roll out
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n calico-system rollout status daemonset/calico-node --timeout=600s
+  register: _calico_ds
+  retries: 3
+  delay: 20
+  until: _calico_ds.rc == 0
+  changed_when: false
+
+- name: cni | calico | Wait for the Tigera installation to report degraded=false
+  ansible.builtin.shell:
+    cmd: >-
+      {{ _kubectl }} get tigerastatus calico
+      -o jsonpath='{.status.conditions[?(@.type=="Available")].status}'
+  register: _tigera_status
+  retries: 30
+  delay: 10
+  until: (_tigera_status.stdout | default('')) == 'True'
+  changed_when: false

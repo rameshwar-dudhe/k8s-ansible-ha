@@ -1,0 +1,82 @@
+---
+- name: runtime | Install and configure {{ cri }}
+  ansible.builtin.include_tasks: "{{ cri }}.yml"
+
+# ============================================================================
+#  Only ONE container runtime should be running. Leaving the other active
+#  wastes resources, keeps a stale image/container store around, and makes
+#  "which runtime is this pod on?" ambiguous during debugging.
+# ============================================================================
+- name: runtime | Identify the runtime that is NOT in use
+  ansible.builtin.set_fact:
+    _other_cri: "{{ 'crio' if cri == 'containerd' else 'containerd' }}"
+
+- name: runtime | Check whether the unused runtime is installed
+  ansible.builtin.command: "systemctl is-enabled {{ _other_cri }}"
+  register: _other_state
+  changed_when: false
+  failed_when: false
+
+# Docker depends on containerd, so stopping it would take Docker down too.
+- name: runtime | Check whether Docker is present (it owns containerd)
+  ansible.builtin.command: systemctl is-active docker
+  register: _docker_state
+  changed_when: false
+  failed_when: false
+
+- name: runtime | Stop and disable the unused container runtime
+  when:
+    - _other_state.rc == 0
+    - not (_other_cri == 'containerd' and (_docker_state.stdout | trim) == 'active')
+  ansible.builtin.systemd_service:
+    name: "{{ _other_cri }}"
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: runtime | Explain why the unused runtime was left running
+  when:
+    - _other_state.rc == 0
+    - _other_cri == 'containerd'
+    - (_docker_state.stdout | trim) == 'active'
+  ansible.builtin.debug:
+    msg: >-
+      Leaving containerd running on {{ inventory_hostname }} — Docker is active
+      and depends on it. kubelet still uses {{ cri }}; containerd is simply idle.
+
+# crictl is the CRI debugging tool upstream's docs use. It arrives as a kubeadm
+# dependency on some distros but NOT with the CRI-O package, so install it
+# explicitly rather than writing a config file for a binary that may not exist.
+- name: runtime | Install cri-tools (crictl)
+  ansible.builtin.package:
+    name: cri-tools
+    state: present
+  failed_when: false
+
+- name: runtime | Point crictl at {{ cri }}
+  ansible.builtin.copy:
+    dest: /etc/crictl.yaml
+    mode: "0644"
+    content: |
+      # Managed by k8s-ansible-ha
+      runtime-endpoint: {{ cri_socket }}
+      image-endpoint: {{ cri_socket }}
+      timeout: 10
+      debug: false
+
+# NOTE: deliberately not using `crictl` here. crictl arrives with the
+# cri-tools package, which is pulled in as a kubeadm dependency by the
+# kube_packages role -- which runs *after* this one. Check the socket directly.
+- name: runtime | Wait for the CRI socket to appear
+  ansible.builtin.stat:
+    path: "{{ cri_socket | regex_replace('^unix://', '') }}"
+  register: _cri_sock
+  retries: 12
+  delay: 5
+  until: _cri_sock.stat.exists | default(false)
+
+- name: runtime | Confirm the runtime service is active
+  ansible.builtin.command: "systemctl is-active {{ cri }}"
+  register: _cri_active
+  changed_when: false
+  failed_when: _cri_active.stdout | trim != 'active'

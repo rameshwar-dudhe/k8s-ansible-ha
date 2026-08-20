@@ -1,0 +1,119 @@
+---
+# ============================================================================
+#  CRI-O.
+#
+#  NOTE ON THE REPO URL: the commonly-quoted
+#      https://pkgs.k8s.io/addons:/cri-o:/stable:/vX.Y/
+#  now returns HTTP 403. CRI-O stable builds live in the openSUSE Build
+#  Service `isv:` namespace instead:
+#      https://download.opensuse.org/repositories/isv:/cri-o:/stable:/vX.Y/
+#  Verified against v1.34 / v1.35 / v1.36 (deb and rpm) on 2026-08-11.
+# ============================================================================
+
+- name: runtime | crio | Compose the repository base URL
+  ansible.builtin.set_fact:
+    _crio_base: "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v{{ crio_minor }}"
+
+# ─────────────────────────────── Debian ────────────────────────────────────
+- name: runtime | crio | Debian | Create the keyring directory
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: runtime | crio | Debian | Fetch the CRI-O signing key
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.get_url:
+    url: "{{ _crio_base }}/deb/Release.key"
+    dest: /tmp/crio-release.key
+    mode: "0644"
+    force: true
+
+- name: runtime | crio | Debian | Dearmor the signing key
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.shell:
+    cmd: gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg /tmp/crio-release.key
+    creates: /etc/apt/keyrings/cri-o-apt-keyring.gpg
+
+- name: runtime | crio | Debian | Add the CRI-O repository
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] {{ _crio_base }}/deb/ /"
+    filename: cri-o
+    state: present
+    update_cache: true
+
+- name: runtime | crio | Debian | Install CRI-O
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.apt:
+    name: cri-o
+    state: present
+
+# ─────────────────────────────── RedHat ────────────────────────────────────
+- name: runtime | crio | RedHat | Add the CRI-O repository
+  when: ansible_facts.os_family == 'RedHat'
+  ansible.builtin.yum_repository:
+    name: cri-o
+    description: "CRI-O v{{ crio_minor }}"
+    baseurl: "{{ _crio_base }}/rpm/"
+    gpgcheck: true
+    gpgkey: "{{ _crio_base }}/rpm/repodata/repomd.xml.key"
+    enabled: true
+
+- name: runtime | crio | RedHat | Install CRI-O
+  when: ansible_facts.os_family == 'RedHat'
+  ansible.builtin.dnf:
+    name: cri-o
+    state: present
+    disable_gpg_check: false
+
+# ──────────────────────────── Configuration ────────────────────────────────
+- name: runtime | crio | Ensure the drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/crio/crio.conf.d
+    state: directory
+    mode: "0755"
+
+- name: runtime | crio | Write the kubeadm drop-in
+  ansible.builtin.copy:
+    dest: /etc/crio/crio.conf.d/10-kubeadm.conf
+    mode: "0644"
+    content: |
+      # Managed by k8s-ansible-ha
+      [crio.runtime]
+      cgroup_manager = "systemd"
+      conmon_cgroup = "pod"
+      log_level = "info"
+
+      [crio.image]
+      pause_image = "{{ pause_image }}"
+
+      [crio.network]
+      # kubeadm + the CNI role own this directory.
+      plugin_dirs = ["/opt/cni/bin", "/usr/libexec/cni"]
+  notify: restart crio
+
+# CRI-O ships a default bridge CNI that fights whichever CNI we actually
+# install. Remove it before the cluster comes up.
+- name: runtime | crio | Remove the bundled default CNI config
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/cni/net.d/10-crio-bridge.conf
+    - /etc/cni/net.d/10-crio-bridge.conflist
+    - /etc/cni/net.d/11-crio-ipv4-bridge.conflist
+    - /etc/cni/net.d/100-crio-bridge.conf
+    - /etc/cni/net.d/200-loopback.conf
+  notify: restart crio
+
+- name: runtime | crio | Enable and start CRI-O
+  ansible.builtin.systemd_service:
+    name: crio
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: runtime | crio | Apply pending restarts before continuing
+  ansible.builtin.meta: flush_handlers

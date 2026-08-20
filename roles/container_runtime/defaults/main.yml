@@ -1,0 +1,9 @@
+---
+# Docker repo suite to pull containerd.io from.
+# "" = use the distro codename (e.g. resolute for Ubuntu 26.04), falling back
+# to `containerd_docker_suite_fallback` if Docker has not published it yet.
+containerd_docker_suite: ""
+containerd_docker_suite_fallback: "noble"
+
+# Regenerate /etc/containerd/config.toml even if one already exists.
+containerd_force_config: false

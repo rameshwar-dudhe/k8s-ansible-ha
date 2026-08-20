@@ -1,0 +1,83 @@
+---
+# ============================================================================
+#  Converts nodes from a DHCP lease to a static address of the SAME value.
+#
+#    ansible-playbook playbooks/set-static-ip.yml -e static_ip_enabled=true
+#    ansible-playbook playbooks/set-static-ip.yml -e static_ip_enabled=true --limit k8s-cp-0
+#
+#  Why: the node IP is written into the API server certificate SANs, the etcd
+#  peer URLs and kubelet --node-ip when the cluster is built. If the DHCP lease
+#  ever moves, the cluster breaks and is tedious to repair.
+#
+#  Safety: before applying, a systemd timer is armed on the node to restore the
+#  previous netplan config and re-apply it. The timer is cancelled only once
+#  Ansible has proven it can still reach the node. Get the config wrong and the
+#  node repairs itself rather than needing console access.
+#
+#  Runs serially so a mistake can only ever strand one node at a time.
+# ============================================================================
+
+- name: Import — safety guard (runs first, before any remote connection)
+  ansible.builtin.import_playbook: guard.yml
+
+- name: Pin node addresses
+  hosts: k8s_cluster
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+
+  pre_tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+
+    - name: Require an explicit opt-in
+      ansible.builtin.assert:
+        that:
+          - static_ip_enabled | bool
+        fail_msg: |
+          This playbook rewrites the node's network configuration and will not
+          run by accident. Re-run with:  -e static_ip_enabled=true
+        quiet: true
+
+  roles:
+    - role: static_ip
+
+  post_tasks:
+    # This playbook is also used BEFORE the cluster exists, to pin addresses
+    # ahead of `kubeadm init`. Without this check the health probe below would
+    # retry against a missing admin.conf and fail an otherwise clean run.
+    - name: Look for an initialised cluster
+      when: inventory_hostname in (groups['masters'] | default([]))
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: _admin
+
+    - name: Confirm the cluster is still healthy
+      when:
+        - inventory_hostname in (groups['masters'] | default([]))
+        - _admin.stat.exists | default(false)
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: _post
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: _post.rc == 0
+
+    - name: Cluster state after the change
+      when:
+        - inventory_hostname in (groups['masters'] | default([]))
+        - _admin.stat.exists | default(false)
+      ansible.builtin.debug:
+        msg: "{{ _post.stdout_lines }}"
+
+    - name: Note that there is no cluster to check yet
+      when:
+        - inventory_hostname in (groups['masters'] | default([]))
+        - not (_admin.stat.exists | default(false))
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is pinned to {{ static_ip_address }}. No
+          cluster on this node yet, so nothing to health-check — this is the
+          right order: pin addresses first, then build.

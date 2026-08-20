@@ -1,0 +1,158 @@
+---
+# ============================================================================
+#  Every knob for the cluster lives here. Override any of them on the CLI:
+#      ansible-playbook playbooks/create-cluster.yml -e cni=cilium -e cri=crio
+# ============================================================================
+
+# ─────────────────────────── Guard rails ───────────────────────────────────
+# The safety role aborts the run if any of these appear anywhere.
+forbidden_hosts:
+  - "192.168.56.133"
+
+# Belt-and-braces: every managed host must resolve to one of these.
+# This is a PERMIT list, not a target list — an address here is only touched if
+# it also appears in inventory/hosts.yml. `forbidden_hosts` always wins, so
+# .133 can never be reached even if it were listed here by mistake.
+#
+# Covers the 4 masters + 4 workers templated in hosts.yml:
+#   .134 cp-0   .136 cp-1   .137 cp-2   .138 cp-3
+#   .135 w-0    .139 w-1    .140 w-2    .141 w-3
+#
+# NOTE: every one of these sits INSIDE the VMware NAT DHCP pool (.128-.254).
+# That is a deliberate choice to keep the existing addresses, but it carries a
+# real hazard: the DHCP server can lease one of these to another VM while its
+# node is down. NetworkManager then fails the whole connection at boot on
+# duplicate-address detection and the NIC comes up with NO address at all --
+# which is exactly what happened to cp-0 on .134.
+#
+# The mitigation lives OUTSIDE this repo: reserve/exclude these addresses on the
+# VMware host's DHCP server (/etc/vmware/vmnet*/dhcpd/dhcpd.conf on a Linux
+# host, then `vmware-networks --stop && vmware-networks --start`).
+allowed_hosts:
+  - "192.168.56.134"
+  - "192.168.56.135"
+  - "192.168.56.136"
+  - "192.168.56.137"
+  - "192.168.56.138"
+  - "192.168.56.139"
+  - "192.168.56.140"
+  - "192.168.56.141"
+
+# ─────────────────────────── Kubernetes ────────────────────────────────────
+k8s_minor: "1.36"          # package repo stream: pkgs.k8s.io/core:/stable:/v1.36
+k8s_patch: ""              # "" = newest patch in the minor (1.36.3 as of Aug 2026)
+                           # or pin exactly, e.g. "1.36.3"
+k8s_deb_revision: "1.1"    # deb version suffix -> kubeadm=1.36.1-1.1
+
+cluster_name: "k8s-ha"
+pod_cidr: "10.244.0.0/16"
+service_cidr: "10.96.0.0/12"
+
+# nftables | iptables | ipvs | none
+#
+#   nftables - stable/GA since Kubernetes v1.33 and the mode upstream now
+#              recommends for Linux. Default here.
+#   iptables - the traditional upstream default. Still fully supported, and the
+#              only mode where NodePort answers on 127.0.0.1.
+#   ipvs     - DEPRECATED in Kubernetes v1.35. kube-proxy logs a warning on
+#              startup, it is disabled by default from v1.40 and removed in
+#              v1.43. Selectable, but the common role warns when you use it.
+#   none     - kube-proxy is skipped entirely (only valid with cni=cilium)
+#
+# Ref: https://kubernetes.io/docs/reference/networking/virtual-ips/
+kube_proxy_mode: "nftables"
+
+# Which local addresses accept NodePort traffic (cluster-wide kube-proxy setting).
+#
+# [] = derive automatically. This matters: in nftables mode kube-proxy populates
+# its `nodeport-ips` set with each node's PRIMARY IP only, which EXCLUDES the
+# kube-vip VIP — so NodePort Services answer on 192.168.56.134 but NOT on the
+# floating VIP. Under the old ipvs mode they answered on both, because IPVS
+# created a virtual service per local address.
+#
+# When kube-vip is enabled and this is left empty, the node network CIDR is
+# used, so both the node addresses and the VIP accept NodePort traffic — which
+# is the point of having a floating address in the first place.
+kube_proxy_nodeport_addresses: []
+
+# The taint does NOT block system add-ons: CoreDNS, Calico/Cilium and kube-vip
+# all carry control-plane tolerations and schedule fine on a lone tainted node
+# (verified — CoreDNS comes up 2/2 Running). What it blocks is YOUR workloads,
+# which stay Pending until a worker joins. Flip this to true for a single-node
+# setup, or add a toleration to the workload (see examples/httpd.yaml).
+remove_control_plane_taint: false
+
+# ────────────────────────── Container runtime ──────────────────────────────
+cri: "containerd"          # containerd | crio
+crio_minor: "1.36"         # CRI-O stream, keep aligned with k8s_minor
+pause_image: "registry.k8s.io/pause:3.10"
+
+cri_socket: >-
+  {{ 'unix:///run/containerd/containerd.sock'
+     if cri == 'containerd'
+     else 'unix:///run/crio/crio.sock' }}
+
+# ───────────────────────────────  CNI  ──────────────────────────────────────
+cni: "calico"              # calico | cilium | weavenet
+
+calico_version: "v3.32.1"      # tigera-operator driven
+calico_encapsulation: "VXLANCrossSubnet"   # VXLAN | IPIP | VXLANCrossSubnet | None
+
+# Which addresses Calico may pick as a node's own IP. These VMs are multi-homed,
+# so leaving it unconstrained lets calico-node latch onto a NAT or host-only
+# interface at random.
+#
+# It MUST be a network covering every node, not one host. The Installation is a
+# single cluster-wide resource, so a per-host /32 works on the control plane and
+# breaks calico-node on every worker -- silently, because the node still reports
+# Ready once the CNI config file exists. Derived from the node network here.
+node_network_prefix: 24
+calico_autodetect_cidrs:
+  - "{{ (node_ip ~ '/' ~ node_network_prefix) | ansible.utils.ipaddr('network/prefix') }}"
+
+cilium_version: "1.20.0"
+# Keep the CLI at or ahead of the Cilium release it installs — an older CLI may
+# not recognise a newer chart version.
+cilium_cli_version: "v0.19.7"
+
+# Weaveworks archived the original project. This is the community fork.
+weavenet_version: "v2.9.0"
+weavenet_repo: "rajch/weave"
+
+# ────────────────────────────── kube-vip ───────────────────────────────────
+kubevip_enabled: true
+kubevip_version: "v1.2.3"
+# MUST stay outside the DHCP pool. This is a VMware NAT network (vmnet-style):
+#   .1   VMware host adapter      .2    NAT gateway / DNS
+#   .254 VMware DHCP server       .128-.254  DHCP pool
+# Safe static range is .3-.127, so the VIP lives at .100.
+# .140 was rejected: it sits inside the pool and VMware could lease it to
+# another VM later, hijacking the control-plane endpoint.
+kubevip_vip: "192.168.56.100"
+kubevip_vip_subnet: "32"
+kubevip_mode: "arp"        # arp | bgp
+kubevip_interface: ""      # "" = auto-detect the NIC that owns node_ip
+kubevip_svc_enable: false  # also act as a LoadBalancer provider for Services
+
+# BGP mode only (ignored when kubevip_mode=arp)
+kubevip_bgp_as: 65000
+kubevip_bgp_peeras: 65000
+kubevip_bgp_peers: ""      # "192.168.56.1:65000::false,..."
+
+control_plane_port: 6443
+
+# The API endpoint every node joins through. With kube-vip this is the VIP,
+# which is exactly what makes the control plane highly available.
+control_plane_endpoint: >-
+  {{ kubevip_vip if kubevip_enabled
+     else hostvars[groups['master_primary'][0]].node_ip }}
+
+# ────────────────────────────── Firewall ───────────────────────────────────
+# open    -> punch the required holes in ufw/firewalld (default)
+# disable -> stop and disable the host firewall entirely (lab shortcut)
+# ignore  -> do not touch the firewall at all
+firewall_action: "open"
+
+# ──────────────────────── Local artifacts (control node) ───────────────────
+# admin.conf and join commands are written here, mode 0600.
+artifacts_dir: "{{ inventory_dir }}/../artifacts"

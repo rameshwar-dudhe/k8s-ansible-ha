@@ -1,0 +1,110 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+---
+# ============================================================================
+#  kubeadm configuration — managed by k8s-ansible-ha
+#  API version v1beta4 (Kubernetes 1.31+; v1beta3 is removed in 1.35+).
+#
+#  NOTE: this comment block MUST stay BELOW the first `---`. kubeadm splits the
+#  file on document separators and decodes each chunk independently; anything
+#  above the first `---` becomes a leading document that decodes to nil, and
+#  kubeadm rejects the whole file with:
+#     invalid configuration for GroupVersionKind /, Kind=:
+#     kind and apiVersion is mandatory information that must be specified
+# ============================================================================
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: {{ node_ip }}
+  bindPort: {{ control_plane_port }}
+nodeRegistration:
+  name: {{ inventory_hostname }}
+  criSocket: {{ cri_socket }}
+  imagePullPolicy: IfNotPresent
+  kubeletExtraArgs:
+    - name: node-ip
+      value: {{ node_ip }}
+{% if kubevip_enabled | bool %}
+# Give kube-vip time to publish the VIP before kubeadm gives up waiting on it.
+timeouts:
+  controlPlaneComponentHealthCheck: 5m0s
+  kubeletHealthCheck: 5m0s
+{% endif %}
+
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: {{ _kubeadm_v.stdout | trim }}
+clusterName: {{ cluster_name }}
+# Every node joins through this address. With kube-vip it is the floating VIP,
+# which is precisely what lets a control plane fail over without reconfiguring
+# any kubelet.
+controlPlaneEndpoint: {{ control_plane_endpoint }}:{{ control_plane_port }}
+networking:
+  podSubnet: {{ pod_cidr }}
+  serviceSubnet: {{ service_cidr }}
+  dnsDomain: cluster.local
+apiServer:
+  certSANs:
+    - localhost
+    - 127.0.0.1
+    - kubernetes
+    - kubernetes.default
+    - kubernetes.default.svc
+    - kubernetes.default.svc.cluster.local
+    - {{ cluster_name }}-vip
+{% if kubevip_enabled | bool %}
+    - {{ kubevip_vip }}
+{% endif %}
+{% for h in (groups['masters'] | default([])) %}
+    - {{ h }}
+    - {{ hostvars[h].node_ip | default(hostvars[h].ansible_host) }}
+{% endfor %}
+  extraArgs:
+    - name: authorization-mode
+      value: Node,RBAC
+controllerManager:
+  extraArgs:
+    - name: allocate-node-cidrs
+      value: "true"
+    - name: cluster-cidr
+      value: {{ pod_cidr }}
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# Must match the container runtime's cgroup driver or kubelet refuses to start.
+cgroupDriver: systemd
+# Detected in the common role. On a systemd-resolved host /etc/resolv.conf is a
+# stub pointing at 127.0.0.53; handing that to CoreDNS creates a resolution loop.
+resolvConf: {{ kubelet_resolv_conf }}
+
+{% if kube_proxy_mode != 'none' %}
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+# nftables is stable since v1.33 and is what upstream recommends for Linux.
+# ipvs is deprecated as of v1.35 and removed in v1.43.
+mode: {{ kube_proxy_mode }}
+{% set _npa = kube_proxy_nodeport_addresses
+              if (kube_proxy_nodeport_addresses | length > 0)
+              else ([ ansible_facts.default_ipv4.network ~ '/' ~ ansible_facts.default_ipv4.prefix ]
+                    if (kubevip_enabled | bool) else []) %}
+{% if _npa | length > 0 %}
+# Without this, nftables mode accepts NodePort traffic on each node's primary
+# IP only, and the kube-vip VIP would not answer NodePort.
+nodePortAddresses:
+{% for cidr in _npa %}
+  - {{ cidr }}
+{% endfor %}
+{% endif %}
+{% if kube_proxy_mode == 'ipvs' %}
+ipvs:
+  # strictARP stops the node answering ARP for IPs it does not own, which
+  # matters when kube-vip also serves Service load balancer addresses.
+  strictARP: true
+  scheduler: rr
+{% endif %}
+{% endif %}

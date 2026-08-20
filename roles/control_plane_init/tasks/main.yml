@@ -1,0 +1,249 @@
+---
+# ============================================================================
+#  Bootstraps the FIRST control plane. Idempotent: if /etc/kubernetes/admin.conf
+#  already exists the init is skipped and we just re-converge kube-vip,
+#  the kubeconfig and the join artifacts.
+# ============================================================================
+
+- name: init | Check whether this node is already initialised
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: _admin_conf
+
+- name: init | Resolve the exact Kubernetes version from the installed kubeadm
+  ansible.builtin.command: kubeadm version -o short
+  register: _kubeadm_v
+  changed_when: false
+
+- name: init | Announce
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Already initialised — reconverging.' if _admin_conf.stat.exists
+         else 'Bootstrapping control plane' }}
+      {{ _kubeadm_v.stdout | trim }} on {{ inventory_hostname }}
+      ({{ node_ip }}) — endpoint {{ control_plane_endpoint }}:{{ control_plane_port }},
+      cri={{ cri }}, cni={{ cni }}, kube-proxy={{ kube_proxy_mode }}
+
+# ══════════════════════════════ FIRST INIT ══════════════════════════════════
+- name: init | Bootstrap the cluster
+  when: not _admin_conf.stat.exists
+  block:
+
+    # ── kube-vip, pass 1 of 2 ────────────────────────────────────────────
+    # Must exist BEFORE `kubeadm init`, because controlPlaneEndpoint points at
+    # the VIP and kubeadm will not finish until something answers there.
+    # Points at super-admin.conf: see roles/kubevip/defaults/main.yml.
+    - name: init | Render kube-vip against super-admin.conf (bootstrap identity)
+      ansible.builtin.include_role:
+        name: kubevip
+      vars:
+        kubevip_kubeconfig: /etc/kubernetes/super-admin.conf
+
+    - name: init | Render the kubeadm configuration
+      ansible.builtin.template:
+        src: kubeadm-config.yaml.j2
+        dest: /etc/kubernetes/kubeadm-config.yaml
+        mode: "0600"
+
+    # Fail fast on a malformed config. Without this the first symptom is an
+    # opaque failure from `images pull`, which looks like a registry problem
+    # rather than a config problem.
+    - name: init | Validate the kubeadm configuration
+      ansible.builtin.command: >-
+        kubeadm config validate --config /etc/kubernetes/kubeadm-config.yaml
+      register: _kubeadm_validate
+      changed_when: false
+
+    - name: init | Pre-pull control-plane images
+      ansible.builtin.command: >-
+        kubeadm config images pull --config /etc/kubernetes/kubeadm-config.yaml
+      register: _pull
+      changed_when: "'Pulled' in (_pull.stdout | default(''))"
+      async: 900
+      poll: 15
+
+    - name: init | Run kubeadm init
+      ansible.builtin.command: >-
+        kubeadm init
+        --config /etc/kubernetes/kubeadm-config.yaml
+        --upload-certs
+        {% if kube_proxy_mode == 'none' %}--skip-phases=addon/kube-proxy{% endif %}
+      register: _kubeadm_init
+      changed_when: true
+      async: 1200
+      poll: 15
+
+    - name: init | Save the kubeadm init log on the node
+      ansible.builtin.copy:
+        dest: /var/log/kubeadm-init.log
+        mode: "0600"
+        content: |
+          {{ _kubeadm_init.stdout | default('') }}
+          --- stderr ---
+          {{ _kubeadm_init.stderr | default('') }}
+
+  rescue:
+    - name: init | Collect kubelet logs to explain the failure
+      ansible.builtin.command: journalctl -u kubelet --no-pager -n 80
+      register: _kubelet_log
+      changed_when: false
+      failed_when: false
+
+    - name: init | Show why kubeadm init failed
+      ansible.builtin.debug:
+        msg: >-
+          {{ (_kubeadm_init.stdout_lines | default([]))
+             + (_kubeadm_init.stderr_lines | default([]))
+             + ['--- last 80 kubelet log lines ---']
+             + (_kubelet_log.stdout_lines | default([])) }}
+
+    - name: init | Abort
+      ansible.builtin.fail:
+        msg: |
+          Control-plane bootstrap failed on {{ inventory_hostname }}.
+
+          Actual error:
+            {{ ansible_failed_result.msg | default('(see the task output above)') }}
+
+          If that error came from `kubeadm init` itself, the usual causes are:
+          the VIP {{ kubevip_vip }} being unreachable or already taken, swap
+          still enabled, or the {{ cri }} socket not responding.
+
+# ══════════════════════════ POST-INIT CONVERGENCE ═══════════════════════════
+
+- name: init | Create root's kube config directory
+  ansible.builtin.file:
+    path: /root/.kube
+    state: directory
+    mode: "0700"
+
+- name: init | Install admin.conf as root's kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: true
+    mode: "0600"
+
+# ── kube-vip, pass 2 of 2 ───────────────────────────────────────────────────
+# Now that the cluster exists, drop the elevated bootstrap identity and run on
+# the normal admin kubeconfig. Rewriting the manifest makes kubelet restart the
+# static pod automatically.
+- name: init | Re-render kube-vip against admin.conf (steady state)
+  ansible.builtin.include_role:
+    name: kubevip
+  vars:
+    kubevip_kubeconfig: /etc/kubernetes/admin.conf
+
+- name: init | Wait for the API server to serve on the VIP
+  ansible.builtin.uri:
+    url: "https://{{ control_plane_endpoint }}:{{ control_plane_port }}/healthz"
+    validate_certs: false
+    return_content: true
+  register: _healthz
+  retries: 40
+  delay: 5
+  until: (_healthz.content | default('')) == 'ok'
+
+- name: init | Wait for this node to register with the API server
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf get node {{ inventory_hostname }}
+    -o jsonpath={.metadata.name}
+  register: _node_reg
+  retries: 30
+  delay: 5
+  until: _node_reg.rc == 0
+  changed_when: false
+
+- name: init | Remove the control-plane NoSchedule taint
+  when: remove_control_plane_taint | bool
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes --all
+    node-role.kubernetes.io/control-plane:NoSchedule-
+  register: _untaint
+  changed_when: "'untainted' in (_untaint.stdout | default(''))"
+  failed_when:
+    - _untaint.rc != 0
+    - "'not found' not in (_untaint.stderr | default(''))"
+
+- name: init | Note the scheduling implications of the taint
+  when:
+    - not (remove_control_plane_taint | bool)
+    - (groups['workers'] | default([]) | length) == 0
+  ansible.builtin.debug:
+    msg:
+      - "NOTE: the control-plane NoSchedule taint is in place and there are no workers."
+      - "System add-ons (CoreDNS, Calico, kube-vip) carry control-plane tolerations"
+      - "and WILL schedule here. Your own workloads will NOT — they stay Pending"
+      - "until you add a worker with add-worker.yml, or set"
+      - "remove_control_plane_taint=true for a single-node setup."
+
+# ───────────────────────── Join artifacts (stored locally) ──────────────────
+- name: init | Generate the worker join command
+  ansible.builtin.command: kubeadm token create --print-join-command --ttl 24h
+  register: _worker_join
+  changed_when: true
+
+- name: init | Upload certificates and capture the certificate key
+  ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
+  register: _cert_key_raw
+  changed_when: true
+
+- name: init | Extract the certificate key
+  ansible.builtin.set_fact:
+    kubeadm_worker_join: "{{ _worker_join.stdout | trim }}"
+    kubeadm_cert_key: "{{ _cert_key_raw.stdout_lines | last | trim }}"
+
+- name: init | Build the control-plane join command
+  ansible.builtin.set_fact:
+    kubeadm_master_join: >-
+      {{ kubeadm_worker_join }} --control-plane
+      --certificate-key {{ kubeadm_cert_key }}
+
+- name: init | Ensure the local artifacts directory exists
+  delegate_to: localhost
+  become: false
+  ansible.builtin.file:
+    path: "{{ artifacts_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: init | Store admin.conf on the control node
+  ansible.builtin.fetch:
+    src: /etc/kubernetes/admin.conf
+    dest: "{{ artifacts_dir }}/admin.conf"
+    flat: true
+
+- name: init | Point the fetched kubeconfig at the VIP
+  delegate_to: localhost
+  become: false
+  ansible.builtin.replace:
+    path: "{{ artifacts_dir }}/admin.conf"
+    regexp: 'server:\s*https://\S+'
+    replace: "server: https://{{ control_plane_endpoint }}:{{ control_plane_port }}"
+
+- name: init | Store the join commands on the control node
+  delegate_to: localhost
+  become: false
+  ansible.builtin.copy:
+    dest: "{{ artifacts_dir }}/join-commands.sh"
+    mode: "0600"
+    content: |
+      #!/usr/bin/env bash
+      # Generated by k8s-ansible-ha from {{ inventory_hostname }} ({{ node_ip }}).
+      # The token expires 24h after generation; the certificate key after 2h.
+      # Both are regenerated automatically by add-worker.yml / add-master.yml,
+      # so this file is for manual/emergency use only.
+
+      # ---- Join a WORKER ----
+      {{ kubeadm_worker_join }}
+
+      # ---- Join a CONTROL PLANE ----
+      {{ kubeadm_master_join }}
+
+- name: init | Done
+  ansible.builtin.debug:
+    msg:
+      - "Control plane is up: {{ inventory_hostname }} ({{ node_ip }})"
+      - "API endpoint : https://{{ control_plane_endpoint }}:{{ control_plane_port }}"
+      - "kubeconfig   : {{ artifacts_dir }}/admin.conf"
+      - "Next         : the CNI role installs {{ cni }}"

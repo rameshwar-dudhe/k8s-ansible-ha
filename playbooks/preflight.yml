@@ -1,0 +1,91 @@
+---
+# ============================================================================
+#  Read-only. Changes nothing. Run this first, and any time you are unsure
+#  what the playbooks are about to touch.
+#
+#    ansible-playbook playbooks/preflight.yml
+# ============================================================================
+
+- name: Import — safety guard (runs first, before any remote connection)
+  ansible.builtin.import_playbook: guard.yml
+
+- name: Preflight — verify targets and report the planned configuration
+  hosts: k8s_cluster
+  gather_facts: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+
+    - name: Report what this host looks like
+      ansible.builtin.debug:
+        msg:
+          - "host          : {{ inventory_hostname }} ({{ ansible_host }})"
+          - "os            : {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }} ({{ ansible_facts.os_family }})"
+          - "arch          : {{ ansible_facts.architecture }}"
+          - "cpus / memory : {{ ansible_facts.processor_vcpus }} vCPU / {{ ansible_facts.memtotal_mb }} MB"
+          - "addresses     : {{ ansible_facts.all_ipv4_addresses | join(', ') }}"
+          - "swap          : {{ ansible_facts.swaptotal_mb }} MB (must end up 0)"
+          - "role          : {{ 'control-plane' if inventory_hostname in (groups['masters'] | default([])) else 'worker' }}"
+
+    - name: Check the minimum control-plane resources
+      when: inventory_hostname in (groups['masters'] | default([]))
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.processor_vcpus | int >= 2
+          - ansible_facts.memtotal_mb | int >= 1700
+        fail_msg: >-
+          kubeadm requires at least 2 vCPU and ~2 GB RAM on a control plane.
+          This host has {{ ansible_facts.processor_vcpus }} vCPU /
+          {{ ansible_facts.memtotal_mb }} MB.
+        success_msg: "Resources are sufficient."
+        quiet: true
+
+    - name: Confirm the node can reach the package repositories
+      ansible.builtin.uri:
+        url: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/deb/Release"
+        method: HEAD
+        status_code: [200, 403, 404]
+      register: _repo
+      failed_when: false
+
+    - name: Report repository reachability
+      ansible.builtin.debug:
+        msg: >-
+          pkgs.k8s.io v{{ k8s_minor }} -> HTTP {{ _repo.status | default('unreachable') }}
+          {{ '(OK)' if (_repo.status | default(0)) == 200 else '(check egress / proxy)' }}
+
+    - name: Report the planned cluster configuration
+      run_once: true
+      ansible.builtin.debug:
+        msg:
+          - "kubernetes   : v{{ k8s_minor }}{{ '.' ~ k8s_patch if k8s_patch | length else ' (latest patch)' }}"
+          - "runtime      : {{ cri }}"
+          - "cni          : {{ cni }}"
+          - "kube-proxy   : {{ kube_proxy_mode }}"
+          - "pod cidr     : {{ pod_cidr }}"
+          - "service cidr : {{ service_cidr }}"
+          - "kube-vip     : {{ 'enabled — ' ~ kubevip_vip ~ ' (' ~ kubevip_mode ~ ')' if kubevip_enabled else 'disabled' }}"
+          - "endpoint     : https://{{ control_plane_endpoint }}:{{ control_plane_port }}"
+          - "masters      : {{ groups['masters'] | default([]) | join(', ') | default('none', true) }}"
+          - "workers      : {{ groups['workers'] | default([]) | join(', ') | default('none', true) }}"
+          - "forbidden    : {{ forbidden_hosts | join(', ') }}"
+
+    - name: Check the VIP is not already taken
+      run_once: true
+      when: kubevip_enabled | bool
+      ansible.builtin.command: "ping -c 2 -W 1 {{ kubevip_vip }}"
+      register: _vip
+      changed_when: false
+      failed_when: false
+
+    - name: Report VIP availability
+      run_once: true
+      when: kubevip_enabled | bool
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'VIP ' ~ kubevip_vip ~ ' is free.' if _vip.rc != 0
+             else 'WARNING: ' ~ kubevip_vip ~ ' already answers ICMP. If no cluster
+                   is running yet, pick a different VIP outside the DHCP pool.' }}

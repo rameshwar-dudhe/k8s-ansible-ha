@@ -1,0 +1,35 @@
+---
+# ============================================================================
+#  Gate 1 — pure inventory scan. Runs on localhost with NO remote connection,
+#  so it must be executed before any play that gathers facts.
+#
+#  This ordering is the whole point: `gather_facts: true` opens an SSH session
+#  and runs the setup module. If the guard only ran as a pre_task, a forbidden
+#  host would already have been connected to before the guard ever fired.
+# ============================================================================
+
+- name: safety | Gate 1 | Scan the whole inventory for forbidden addresses
+  vars:
+    _inventory_addrs: >-
+      {{ (groups['all'] | default([]))
+         | map('extract', hostvars, 'ansible_host')
+         | select('defined') | map('string') | list }}
+    _bad_addr: "{{ forbidden_hosts | intersect(_inventory_addrs) }}"
+    _bad_name: "{{ forbidden_hosts | intersect(groups['all'] | default([])) }}"
+  ansible.builtin.assert:
+    that:
+      - _bad_addr | length == 0
+      - _bad_name | length == 0
+    fail_msg: |
+      ================== ABORTED BY SAFETY GUARD ==================
+      Forbidden host in inventory: {{ (_bad_addr + _bad_name) | unique | join(', ') }}
+
+      This repository is not permitted to touch that machine. No connection
+      has been made and nothing has been changed.
+
+      Remove it from the inventory, then re-run.
+      =============================================================
+    success_msg: >-
+      Inventory clean — {{ (groups['all'] | default([])) | length }} host(s)
+      declared, none forbidden.
+    quiet: true

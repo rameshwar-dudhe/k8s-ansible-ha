@@ -1,0 +1,51 @@
+---
+# ============================================================================
+#  Converts a node from a DHCP lease to a static address, via netplan.
+#  Opt-in: nothing happens unless static_ip_enabled is true.
+# ============================================================================
+
+static_ip_enabled: false
+
+# Keep the SAME address the node already has. Changing it after the cluster is
+# built would invalidate the API server certificate SANs and etcd peer URLs.
+static_ip_address: "{{ node_ip }}"
+static_ip_prefix: 24
+
+# "" = auto-detect from the current default route / resolver.
+static_ip_interface: ""
+static_ip_gateway: ""
+static_ip_nameservers: []
+static_ip_search: []
+
+# Leave IPv6 on DHCP? Default false so addressing is fully deterministic.
+static_ip_dhcp6: false
+
+# Move an address rather than pin the one the node already holds. Off by
+# default: moving a node after the cluster is built invalidates its certs.
+static_ip_force_move: false
+
+# ARP-probe the address before writing it. NetworkManager (the netplan renderer
+# on Ubuntu here) runs duplicate address detection when it activates a static
+# profile; if any other host answers, it fails the WHOLE connection with
+# 'ip-config-unavailable' and the interface ends up with no address at all.
+# That is silent at apply time and only bites on the next boot.
+static_ip_conflict_check: true
+
+# Prove the address survives a reboot, not just `netplan apply`. Verifying the
+# apply alone is what let a boot-time DAD failure go unnoticed. Defaults on
+# whenever we are moving an address, which is when the risk is highest.
+#
+# NOTE: the rollback timer is a transient systemd unit and does NOT survive a
+# reboot. It is disarmed before this test runs, so a node that fails to come
+# back needs console access. Keep one open when moving an address.
+static_ip_verify_reboot: "{{ static_ip_force_move | default(false) }}"
+
+# Safety net. Before applying, a systemd timer is armed to restore the previous
+# netplan config and re-apply it after this many seconds. It is cancelled only
+# once Ansible has proven it can still reach the node. If the new config is
+# wrong and we lose contact, the node repairs itself instead of needing console
+# access. Must comfortably exceed the time netplan apply + reconnect takes.
+static_ip_rollback_seconds: 240
+
+static_ip_backup_dir: /root/.netplan-backup-k8s-ansible-ha
+static_ip_netplan_file: /etc/netplan/00-installer-config.yaml

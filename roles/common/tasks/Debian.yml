@@ -1,0 +1,75 @@
+---
+- name: common | Debian | Wait for any running apt/dpkg lock to clear
+  ansible.builtin.shell: |
+    set -e
+    for i in $(seq 1 60); do
+      if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+        && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "apt/dpkg still locked after 5 minutes" >&2
+    exit 1
+  changed_when: false
+
+# ─────────────────────── Install-media apt sources ─────────────────────────
+# Ubuntu's installer leaves a `file:///cdrom` source behind. Once the ISO is
+# detached the repo has no Release file, and apt treats that as a HARD error:
+#   E: The repository 'file:/cdrom resolute Release' no longer has a Release file
+# That fails every `apt update` on the box, so no packages can be installed at
+# all until it is disabled. Files are renamed, not deleted, so it is reversible.
+- name: common | Debian | Disable install-media (cdrom) apt sources
+  when: apt_disable_cdrom_sources | bool
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      changed=0
+      # deb822 format (.sources) — Ubuntu 24.04+
+      for f in /etc/apt/sources.list.d/*.sources; do
+        [ -e "$f" ] || continue
+        if grep -qiE '^URIs:.*(file:/+cdrom|cdrom:)' "$f"; then
+          mv -- "$f" "$f.disabled-by-k8s-ansible-ha"
+          changed=1
+        fi
+      done
+      # legacy one-line format (.list)
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -e "$f" ] || continue
+        if grep -qiE '^[[:space:]]*deb.*cdrom:' "$f"; then
+          sed -i -E 's|^([[:space:]]*deb.*cdrom:.*)$|# \1  # disabled by k8s-ansible-ha|I' "$f"
+          changed=1
+        fi
+      done
+      [ "$changed" -eq 1 ] && echo CHANGED || echo NOCHANGE
+  register: _cdrom_disable
+  changed_when: "'CHANGED' in (_cdrom_disable.stdout | default(''))"
+
+- name: common | Debian | Report disabled install-media sources
+  when:
+    - apt_disable_cdrom_sources | bool
+    - "'CHANGED' in (_cdrom_disable.stdout | default(''))"
+  ansible.builtin.debug:
+    msg: >-
+      Disabled a file:///cdrom apt source on {{ inventory_hostname }} — it had
+      no Release file and was breaking every apt update. Renamed with the
+      suffix .disabled-by-k8s-ansible-ha; rename it back to restore.
+
+- name: common | Debian | Refresh the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: common | Debian | Install base packages
+  ansible.builtin.apt:
+    # Per-mode tooling:
+    #   ipvs     -> ipvsadm AND ipset (kube-proxy's IPVS proxier uses ipset for
+    #               its NodePort/loadbalancer match sets; ipvsadm alone is not
+    #               enough and is a commonly-missed prerequisite)
+    #   nftables -> the nftables userspace tool, for inspecting the rules
+    #               kube-proxy installs
+    name: "{{ ['apt-transport-https', 'ca-certificates', 'curl', 'gnupg',
+               'iproute2', 'iptables', 'conntrack', 'socat', 'ethtool', 'jq']
+              + (['ipvsadm', 'ipset'] if kube_proxy_mode == 'ipvs' else [])
+              + (['nftables'] if kube_proxy_mode == 'nftables' else []) }}"
+    state: present

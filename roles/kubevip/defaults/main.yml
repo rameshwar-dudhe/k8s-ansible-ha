@@ -1,0 +1,17 @@
+---
+# Which kubeconfig the kube-vip static pod reads to talk to the API server.
+#
+# THIS MATTERS. Since Kubernetes 1.29, `kubeadm init` creates BOTH
+# /etc/kubernetes/admin.conf (bound to a limited RBAC identity) and
+# /etc/kubernetes/super-admin.conf (cluster-admin). During `kubeadm init` the
+# limited admin.conf identity cannot yet perform the leases API calls kube-vip
+# needs for control-plane leader election, so the VIP never comes up and
+# `kubeadm init` blocks forever waiting for an endpoint it is itself hosting.
+#
+# The control_plane_init role therefore renders this role twice:
+#   1. before init  -> super-admin.conf
+#   2. after  init  -> admin.conf
+kubevip_kubeconfig: /etc/kubernetes/admin.conf
+
+# Ping the VIP before claiming it, to catch an address already in use.
+kubevip_precheck: true

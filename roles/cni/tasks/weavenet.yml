@@ -1,0 +1,66 @@
+---
+# ============================================================================
+#  Weave Net.
+#
+#  READ THIS FIRST. Weaveworks ceased trading and the original
+#  weaveworks/weave repository is archived — no releases since 2024. This
+#  installs the community fork `{{ weavenet_repo }}` at {{ weavenet_version }},
+#  whose newest published manifest still targets the "k8s-1.11" schema.
+#
+#  It is NOT validated against Kubernetes {{ k8s_minor }}. It is provided
+#  because it was asked for. For anything you depend on, use calico or cilium.
+# ============================================================================
+
+- name: cni | weavenet | Final warning
+  ansible.builtin.debug:
+    msg:
+      - "Installing Weave Net {{ weavenet_version }} from the {{ weavenet_repo }} fork."
+      - "Upstream Weave Net is ARCHIVED and unmaintained."
+      - "If this hangs or the pods crash-loop, switch to -e cni=calico."
+
+- name: cni | weavenet | Create the manifest directory
+  ansible.builtin.file:
+    path: /etc/kubernetes/cni
+    state: directory
+    mode: "0755"
+
+- name: cni | weavenet | Download the Weave Net manifest
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/{{ weavenet_repo }}/releases/download/{{ weavenet_version }}/weave-daemonset-k8s-1.11.yaml
+    dest: /etc/kubernetes/cni/weave-net.yaml
+    mode: "0644"
+
+- name: cni | weavenet | Apply the manifest
+  ansible.builtin.command: >-
+    {{ _kubectl }} apply -f /etc/kubernetes/cni/weave-net.yaml
+  register: _weave_apply
+  changed_when: "'unchanged' not in (_weave_apply.stdout | default(''))"
+
+# The shipped manifest hardcodes Weave's own 10.32.0.0/12 default, which does
+# not match the podSubnet we gave kubeadm. Override it so the IPAM range and
+# the controller-manager's cluster-cidr agree.
+- name: cni | weavenet | Align IPALLOC_RANGE with the cluster pod CIDR
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system set env daemonset/weave-net
+    --containers=weave IPALLOC_RANGE={{ pod_cidr }}
+  register: _weave_env
+  changed_when: "'updated' in (_weave_env.stdout | default('')) or _weave_env.rc == 0"
+
+- name: cni | weavenet | Wait for the weave-net daemonset to roll out
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system rollout status daemonset/weave-net --timeout=600s
+  register: _weave_ds
+  retries: 2
+  delay: 20
+  until: _weave_ds.rc == 0
+  changed_when: false
+  failed_when: false
+
+- name: cni | weavenet | Report if it did not converge
+  when: _weave_ds.rc != 0
+  ansible.builtin.debug:
+    msg:
+      - "Weave Net did not converge within the timeout. This is the expected"
+      - "failure mode of an unmaintained CNI on Kubernetes {{ k8s_minor }}."
+      - "Re-run with -e cni=calico (destroy-cluster.yml first)."

@@ -1,0 +1,20 @@
+---
+# ============================================================================
+#  The first play of every playbook in this repo.
+#
+#  Runs entirely on the control node with no remote connection, so it can
+#  abort BEFORE Ansible SSHes anywhere to gather facts. Never run a playbook
+#  here that does not import this first.
+# ============================================================================
+
+- name: Safety guard — scan the inventory before touching anything
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Scan the inventory for forbidden hosts
+      ansible.builtin.include_role:
+        name: safety
+        tasks_from: inventory

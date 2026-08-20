@@ -1,0 +1,56 @@
+---
+# ============================================================================
+#  Per-host gates. These require facts, so they necessarily run AFTER a
+#  connection has been made -- which is why the inventory scan
+#  (tasks/inventory.yml, driven by playbooks/guard.yml) runs first, locally.
+#
+#  Gate 3 is the one that matters: it catches the case where DNS, a stale
+#  ansible_host, or a changed DHCP lease silently points a "safe" inventory
+#  name at the forbidden machine.
+# ============================================================================
+
+- name: safety | Gate 2 | Re-scan the hosts in this specific play
+  vars:
+    _play_addrs: >-
+      {{ (ansible_play_hosts_all | default([]))
+         | map('extract', hostvars, 'ansible_host')
+         | select('defined') | map('string') | list }}
+  ansible.builtin.assert:
+    that:
+      - forbidden_hosts | intersect(_play_addrs) | length == 0
+    fail_msg: >-
+      ABORT — forbidden host in this play:
+      {{ forbidden_hosts | intersect(_play_addrs) | join(', ') }}
+    quiet: true
+
+- name: safety | Gate 3 | Confirm the connected machine is not a forbidden node
+  vars:
+    _owned: "{{ ansible_facts.all_ipv4_addresses | default([]) }}"
+    _bad_owned: "{{ forbidden_hosts | intersect(_owned) }}"
+  ansible.builtin.assert:
+    that:
+      - _bad_owned | length == 0
+    fail_msg: |
+      ================== ABORTED BY SAFETY GUARD ==================
+      '{{ inventory_hostname }}' ({{ ansible_host | default('?') }}) actually
+      owns forbidden address {{ _bad_owned | join(', ') }}.
+
+      The inventory name looked safe but resolves to a forbidden machine.
+      Refusing to make any change to it.
+      =============================================================
+    success_msg: "{{ inventory_hostname }} verified — not a forbidden node."
+    quiet: true
+
+- name: safety | Gate 3b | Confirm the connected machine is explicitly allowed
+  vars:
+    _owned: "{{ ansible_facts.all_ipv4_addresses | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      - allowed_hosts | intersect(_owned) | length > 0
+    fail_msg: >-
+      ABORT — '{{ inventory_hostname }}' owns {{ _owned | join(', ') }},
+      none of which is in `allowed_hosts`. Add it to
+      inventory/group_vars/all.yml only if you are certain you intend to
+      manage that machine.
+    success_msg: "{{ inventory_hostname }} is in the allow-list."
+    quiet: true

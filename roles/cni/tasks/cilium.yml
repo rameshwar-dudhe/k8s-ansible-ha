@@ -1,0 +1,62 @@
+---
+# ============================================================================
+#  Cilium, installed with the official cilium CLI (no Helm dependency on the
+#  control node, and no Galaxy collections needed).
+# ============================================================================
+
+- name: cni | cilium | Work out the CLI archive name
+  ansible.builtin.set_fact:
+    _cilium_arch: "{{ 'amd64' if ansible_facts.architecture == 'x86_64' else 'arm64' }}"
+
+- name: cni | cilium | Check whether the CLI is already present
+  ansible.builtin.stat:
+    path: /usr/local/bin/cilium
+  register: _cilium_cli
+
+- name: cni | cilium | Download the cilium CLI
+  when: not _cilium_cli.stat.exists
+  ansible.builtin.unarchive:
+    src: >-
+      https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ _cilium_arch }}.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+    mode: "0755"
+
+- name: cni | cilium | Check whether Cilium is already installed
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system get daemonset cilium
+  register: _cilium_present
+  changed_when: false
+  failed_when: false
+
+- name: cni | cilium | Install Cilium
+  when: _cilium_present.rc != 0
+  ansible.builtin.command: >-
+    cilium install
+    --version {{ cilium_version }}
+    --set ipam.mode=cluster-pool
+    --set ipam.operator.clusterPoolIPv4PodCIDRList={{ pod_cidr }}
+    --set operator.replicas=1
+    {% if kube_proxy_mode == 'none' %}
+    --set kubeProxyReplacement=true
+    --set k8sServiceHost={{ control_plane_endpoint }}
+    --set k8sServicePort={{ control_plane_port }}
+    {% else %}
+    --set kubeProxyReplacement=false
+    {% endif %}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: true
+  # operator.replicas=1 because a fresh single-control-plane cluster cannot
+  # satisfy the default 2-replica anti-affinity and the install would hang.
+
+- name: cni | cilium | Wait for Cilium to become ready
+  ansible.builtin.command: cilium status --wait --wait-duration 10m
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: _cilium_status
+  changed_when: false
+
+- name: cni | cilium | Status
+  ansible.builtin.debug:
+    msg: "{{ _cilium_status.stdout_lines | default([]) }}"

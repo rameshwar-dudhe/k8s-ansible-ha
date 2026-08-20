@@ -1,0 +1,96 @@
+---
+# Everything is wrapped in a single conditional block.
+#
+# Deliberately NOT `meta: end_host` when kube-vip is disabled -- that would end
+# the host for the ENTIRE play, silently skipping control_plane_init and the
+# CNI roles that come after this one.
+- name: kubevip | Configure the control-plane VIP
+  when: kubevip_enabled | bool
+  block:
+
+    - name: kubevip | Validate the mode
+      ansible.builtin.assert:
+        that:
+          - kubevip_mode in ['arp', 'bgp']
+        fail_msg: "kubevip_mode must be 'arp' or 'bgp', got '{{ kubevip_mode }}'"
+        quiet: true
+
+    # ─────────────────── Work out which NIC hosts the VIP ──────────────────
+    - name: kubevip | Auto-detect the interface that owns {{ node_ip }}
+      when: kubevip_interface | length == 0
+      ansible.builtin.set_fact:
+        _kubevip_iface: >-
+          {{ (ansible_facts.interfaces
+              | map('replace', '-', '_')
+              | map('extract', ansible_facts)
+              | select('defined')
+              | selectattr('ipv4', 'defined')
+              | selectattr('ipv4.address', 'equalto', node_ip)
+              | map(attribute='device')
+              | list
+              | first) | default('') }}
+
+    - name: kubevip | Use the explicitly configured interface
+      when: kubevip_interface | length > 0
+      ansible.builtin.set_fact:
+        _kubevip_iface: "{{ kubevip_interface }}"
+
+    - name: kubevip | Fail if no interface could be determined
+      ansible.builtin.assert:
+        that:
+          - _kubevip_iface | length > 0
+        fail_msg: >-
+          Could not find the interface holding {{ node_ip }} on
+          {{ inventory_hostname }}. Set `kubevip_interface` in group_vars/all.yml.
+        success_msg: "kube-vip will advertise {{ kubevip_vip }} on {{ _kubevip_iface }}"
+        quiet: true
+
+    # ─────────────────── Sanity-check the VIP itself ───────────────────────
+    # If something already answers on the VIP and it is not our own kube-vip,
+    # we are about to create an address conflict. Catch it before kubeadm does.
+    - name: kubevip | Look for an existing kube-vip manifest
+      ansible.builtin.stat:
+        path: /etc/kubernetes/manifests/kube-vip.yaml
+      register: _vip_manifest
+
+    - name: kubevip | Check whether the VIP is already claimed
+      when:
+        - kubevip_precheck | bool
+        - not _vip_manifest.stat.exists
+      ansible.builtin.command: "ping -c 2 -W 1 {{ kubevip_vip }}"
+      register: _vip_ping
+      changed_when: false
+      failed_when: false
+
+    - name: kubevip | Warn about a possible VIP conflict
+      when:
+        - kubevip_precheck | bool
+        - not _vip_manifest.stat.exists
+        - (_vip_ping.rc | default(1)) == 0
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: {{ kubevip_vip }} already answers ICMP, but this node has"
+          - "no kube-vip manifest yet — something else on the network owns it."
+          - "Choose a different kubevip_vip, or move it outside your DHCP pool."
+
+    # ─────────────────────── Render the static pod ─────────────────────────
+    - name: kubevip | Ensure the static pod directory exists
+      ansible.builtin.file:
+        path: /etc/kubernetes/manifests
+        state: directory
+        mode: "0755"
+
+    - name: kubevip | Render the kube-vip static pod
+      ansible.builtin.template:
+        src: kube-vip.yaml.j2
+        dest: /etc/kubernetes/manifests/kube-vip.yaml
+        mode: "0600"
+        owner: root
+        group: root
+
+    - name: kubevip | Report
+      ansible.builtin.debug:
+        msg: >-
+          kube-vip {{ kubevip_version }} ({{ kubevip_mode | upper }}) on
+          {{ inventory_hostname }} — VIP {{ kubevip_vip }}/{{ kubevip_vip_subnet }}
+          via {{ _kubevip_iface }}, kubeconfig {{ kubevip_kubeconfig }}

@@ -1,0 +1,49 @@
+---
+- name: common | RedHat | Install base packages
+  ansible.builtin.dnf:
+    # See the Debian task for why ipvs needs BOTH ipvsadm and ipset.
+    name: "{{ ['ca-certificates', 'curl', 'gnupg2', 'iproute', 'iproute-tc',
+               'iptables', 'conntrack-tools', 'socat', 'ethtool', 'jq', 'tar',
+               'container-selinux']
+              + (['ipvsadm', 'ipset'] if kube_proxy_mode == 'ipvs' else [])
+              + (['nftables'] if kube_proxy_mode == 'nftables' else []) }}"
+    state: present
+
+# ─── SELinux ────────────────────────────────────────────────────────────────
+# kubelet does not yet support SELinux in enforcing mode. Upstream kubeadm
+# documentation calls for permissive; we do the same and make it survive reboot.
+- name: common | RedHat | Read current SELinux state
+  ansible.builtin.command: getenforce
+  register: _selinux
+  changed_when: false
+  failed_when: false
+
+- name: common | RedHat | Set SELinux permissive for this boot
+  when: _selinux.stdout | default('') | trim == 'Enforcing'
+  ansible.builtin.command: setenforce 0
+  changed_when: true
+
+- name: common | RedHat | Set SELinux permissive persistently
+  ansible.builtin.replace:
+    path: /etc/selinux/config
+    regexp: '^SELINUX=enforcing\s*$'
+    replace: 'SELINUX=permissive'
+  failed_when: false
+
+# ─── NetworkManager ─────────────────────────────────────────────────────────
+# NM will happily rip out CNI-managed virtual interfaces. Tell it to keep away.
+- name: common | RedHat | Check whether NetworkManager is present
+  ansible.builtin.stat:
+    path: /etc/NetworkManager
+  register: _nm
+
+- name: common | RedHat | Stop NetworkManager managing CNI interfaces
+  when: _nm.stat.exists
+  ansible.builtin.copy:
+    dest: /etc/NetworkManager/conf.d/99-kubernetes-cni.conf
+    mode: "0644"
+    content: |
+      # Managed by k8s-ansible-ha
+      [keyfile]
+      unmanaged-devices=interface-name:cali*;interface-name:tunl*;interface-name:vxlan.calico;interface-name:vxlan-v6.calico;interface-name:wireguard.cali;interface-name:wg-v6.cali;interface-name:cilium_*;interface-name:lxc*;interface-name:weave;interface-name:vethwe*;interface-name:datapath;interface-name:flannel*;interface-name:cni0
+  notify: reload networkmanager

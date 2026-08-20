@@ -1,0 +1,4 @@
+---
+# Also remove kubeadm/kubelet/kubectl and the container runtime, not just
+# the cluster state.
+reset_purge_packages: false

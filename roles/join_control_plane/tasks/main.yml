@@ -1,0 +1,101 @@
+---
+- name: join-master | Check whether this node has already joined
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: _kubelet_conf
+
+- name: join-master | Join as an additional control plane
+  when: not _kubelet_conf.stat.exists
+  block:
+
+    # Certificate keys expire after 2 hours, so re-upload rather than reusing
+    # anything cached in artifacts/.
+    - name: join-master | Re-upload certificates on the primary
+      delegate_to: "{{ groups['master_primary'][0] }}"
+      ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
+      register: _cert_key_raw
+      changed_when: true
+
+    - name: join-master | Mint a fresh join command on the primary
+      delegate_to: "{{ groups['master_primary'][0] }}"
+      ansible.builtin.command: kubeadm token create --print-join-command --ttl 2h
+      register: _join_cmd
+      changed_when: true
+
+    - name: join-master | Run kubeadm join --control-plane
+      ansible.builtin.command: >-
+        {{ _join_cmd.stdout | trim }}
+        --control-plane
+        --certificate-key {{ _cert_key_raw.stdout_lines | last | trim }}
+        --cri-socket {{ cri_socket }}
+        --node-name {{ inventory_hostname }}
+        --apiserver-advertise-address {{ node_ip }}
+      register: _join
+      changed_when: true
+      async: 1200
+      poll: 15
+
+  rescue:
+    - name: join-master | Collect kubelet logs
+      ansible.builtin.command: journalctl -u kubelet --no-pager -n 60
+      register: _kubelet_log
+      changed_when: false
+      failed_when: false
+
+    - name: join-master | Explain the failure
+      ansible.builtin.fail:
+        msg: >-
+          {{ (_join.stderr_lines | default([]))
+             + ['--- kubelet ---']
+             + (_kubelet_log.stdout_lines | default([])) }}
+
+- name: join-master | Install root's kubeconfig
+  block:
+    - name: join-master | Create root's kube config directory
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+
+    - name: join-master | Copy admin.conf into place
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: true
+        mode: "0600"
+
+# Only now — the node holds valid certs and admin.conf, so kube-vip can join
+# the leader election and take over the VIP if the primary dies.
+- name: join-master | Add this node to the kube-vip leader election
+  ansible.builtin.include_role:
+    name: kubevip
+  vars:
+    kubevip_kubeconfig: /etc/kubernetes/admin.conf
+
+- name: join-master | Wait for the node to report Ready
+  delegate_to: "{{ groups['master_primary'][0] }}"
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf wait --for=condition=Ready
+    node/{{ inventory_hostname }} --timeout=300s
+  changed_when: false
+
+- name: join-master | Confirm etcd quorum
+  delegate_to: "{{ groups['master_primary'][0] }}"
+  ansible.builtin.shell:
+    cmd: >-
+      kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system
+      get pods -l component=etcd -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{"\n"}{end}'
+  register: _etcd
+  changed_when: false
+
+- name: join-master | etcd members
+  ansible.builtin.debug:
+    msg: "{{ _etcd.stdout_lines | default([]) }}"
+
+- name: join-master | Warn about even-numbered control planes
+  when: (groups['masters'] | default([]) | length) % 2 == 0
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: the cluster now has {{ groups['masters'] | length }} control planes."
+      - "etcd needs an ODD number for a useful quorum — 2 control planes tolerate"
+      - "zero failures, exactly like 1, but with more ways to break. Use 3 or 5."

@@ -1,0 +1,33 @@
+---
+# ============================================================================
+#  kubeadm / kubelet / kubectl from pkgs.k8s.io.
+#  Repo stream: https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/
+#  Packages are held/excluded afterwards so a routine `apt upgrade` can never
+#  silently jump a minor version underneath a live cluster.
+# ============================================================================
+
+- name: packages | Compose the repository base URL
+  ansible.builtin.set_fact:
+    _k8s_base: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}"
+
+- name: packages | Install Kubernetes packages
+  ansible.builtin.include_tasks: "{{ ansible_facts.os_family }}.yml"
+
+- name: packages | Enable kubelet
+  ansible.builtin.systemd_service:
+    name: kubelet
+    state: started
+    enabled: true
+    daemon_reload: true
+  # Until `kubeadm init`/`join` writes a kubeconfig, kubelet crash-loops.
+  # That is expected and not a failure.
+  failed_when: false
+
+- name: packages | Record the installed kubeadm version
+  ansible.builtin.command: kubeadm version -o short
+  register: _kubeadm_version
+  changed_when: false
+
+- name: packages | Report the installed version
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: kubeadm {{ _kubeadm_version.stdout | trim }}"

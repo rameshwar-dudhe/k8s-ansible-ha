@@ -1,0 +1,49 @@
+---
+# Ports every node needs, regardless of role.
+# NodePort belongs here, NOT under _fw_worker: a NodePort Service is reachable
+# on EVERY node in the cluster, control planes included. Scoping it to workers
+# silently breaks NodePort access on a single-node or control-plane-only
+# cluster whenever a host firewall is actually enabled.
+_fw_common:
+  - { port: "10250", proto: tcp, why: "kubelet API" }
+  - { port: "10256", proto: tcp, why: "kube-proxy health" }
+  - { port: "30000-32767", proto: tcp, why: "NodePort services" }
+
+# Control-plane-only ports.
+_fw_control_plane:
+  - { port: "{{ control_plane_port }}", proto: tcp, why: "kube-apiserver" }
+  - { port: "2379-2380", proto: tcp, why: "etcd client + peer" }
+  - { port: "10257", proto: tcp, why: "kube-controller-manager" }
+  - { port: "10259", proto: tcp, why: "kube-scheduler" }
+
+# Worker-only ports. (Empty today -- NodePort moved to _fw_common above, since
+# it applies to every node. Kept as a hook for genuinely worker-specific ports.)
+_fw_worker: []
+
+# Per-CNI requirements.
+_fw_cni:
+  calico:
+    - { port: "179", proto: tcp, why: "Calico BGP" }
+    - { port: "4789", proto: udp, why: "Calico VXLAN" }
+    - { port: "5473", proto: tcp, why: "Calico Typha" }
+  cilium:
+    - { port: "8472", proto: udp, why: "Cilium VXLAN" }
+    - { port: "4240", proto: tcp, why: "Cilium health" }
+    - { port: "4244", proto: tcp, why: "Hubble" }
+  weavenet:
+    - { port: "6783", proto: tcp, why: "Weave control" }
+    - { port: "6783", proto: udp, why: "Weave data" }
+    - { port: "6784", proto: udp, why: "Weave data" }
+
+# kube-vip in BGP mode peers over 179/tcp.
+_fw_kubevip:
+  - { port: "179", proto: tcp, why: "kube-vip BGP" }
+
+# Assembled per-host below.
+firewall_ports: >-
+  {{ (_fw_common
+      + (_fw_control_plane if inventory_hostname in (groups['masters'] | default([])) else [])
+      + (_fw_worker        if inventory_hostname in (groups['workers'] | default([])) else [])
+      + (_fw_cni[cni] | default([]))
+      + (_fw_kubevip if (kubevip_enabled | bool and kubevip_mode == 'bgp') else [])
+     ) | unique }}

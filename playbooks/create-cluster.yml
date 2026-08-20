@@ -1,0 +1,64 @@
+---
+# ============================================================================
+#  The umbrella playbook: build the whole cluster end to end.
+#
+#    ansible-playbook playbooks/create-cluster.yml
+#    ansible-playbook playbooks/create-cluster.yml -e cni=cilium -e cri=crio
+#    ansible-playbook playbooks/create-cluster.yml -e kube_proxy_mode=none -e cni=cilium
+#
+#  Order matters and is not negotiable:
+#    1. preflight     — verify targets, fail before touching anything
+#    2. init-master   — kube-vip + kubeadm init on master_primary, then the CNI
+#    3. add-master    — extra control planes join through the VIP (no-op if none)
+#    4. add-worker    — workers join through the VIP (no-op if none)
+#    5. summary       — where things ended up
+#
+#  Every stage re-runs the `safety` role. 192.168.56.133 is never touched.
+# ============================================================================
+
+- name: Import — preflight
+  ansible.builtin.import_playbook: preflight.yml
+
+- name: Import — initialise the first control plane
+  ansible.builtin.import_playbook: init-master.yml
+
+# No `when:` guard needed — an empty group matches no hosts, so these plays
+# simply report "skipping: no hosts matched" and cost nothing.
+- name: Import — join additional control planes
+  ansible.builtin.import_playbook: add-master.yml
+
+- name: Import — join workers
+  ansible.builtin.import_playbook: add-worker.yml
+
+- name: Summary
+  hosts: master_primary
+  gather_facts: false
+  tasks:
+    - name: Collect the final cluster state
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          echo "=== nodes ==="
+          kubectl get nodes -o wide
+          echo
+          echo "=== control plane + cni pods ==="
+          kubectl get pods -A -o wide --field-selector=status.phase!=Succeeded
+          echo
+          echo "=== kube-vip VIP holder ==="
+          kubectl -n kube-system get lease plndr-cp-lock \
+            -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "(no lease yet)"
+      register: _summary
+      changed_when: false
+
+    - name: Cluster
+      ansible.builtin.debug:
+        msg: "{{ _summary.stdout_lines }}"
+
+    - name: How to use it
+      ansible.builtin.debug:
+        msg:
+          - "kubeconfig written to {{ artifacts_dir }}/admin.conf"
+          - "  export KUBECONFIG={{ artifacts_dir }}/admin.conf"
+          - "  kubectl get nodes"
+          - ""
+          - "API server: https://{{ control_plane_endpoint }}:{{ control_plane_port }}"

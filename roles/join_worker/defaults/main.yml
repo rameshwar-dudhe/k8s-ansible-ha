@@ -1,0 +1,33 @@
+---
+# ============================================================================
+#  join_worker defaults
+# ============================================================================
+
+# After a join, confirm the CNI pod on THIS node is genuinely Ready.
+#
+# Why this is not redundant with `wait --for=condition=Ready node/...`: kubelet
+# flips a node to Ready as soon as a CNI *config file* exists on disk. A CNI pod
+# that writes its config and then crashlooping forever still leaves the node
+# looking healthy, so a worker can join "successfully" with no working pod
+# network. Set to false only if you have a CNI this cannot describe.
+join_worker_verify_cni: true
+
+# Where each supported CNI runs its per-node DaemonSet. The pod selector itself
+# is read from the DaemonSet at runtime rather than hardcoded here -- if a CNI
+# renames its pod labels, this check must break loudly, not silently match zero
+# pods and pass.
+join_worker_cni_daemonsets:
+  calico:
+    namespace: calico-system
+    daemonset: calico-node
+  cilium:
+    namespace: kube-system
+    daemonset: cilium
+  weavenet:
+    namespace: kube-system
+    daemonset: weave-net
+
+# Worst case is roughly retries * (delay + kubectl wait timeout). Generous by
+# default: a fresh worker has to pull the CNI image before it can be Ready.
+join_worker_cni_ready_retries: 20
+join_worker_cni_ready_delay: 15

@@ -1,0 +1,43 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+# ============================================================================
+#  Static address for {{ inventory_hostname }} — managed by k8s-ansible-ha
+#
+#  Was DHCP. Pinned because the node IP is baked into the API server
+#  certificate SANs, the etcd peer URLs and kubelet --node-ip at `kubeadm init`
+#  time; a lease change would break the cluster in a tedious-to-repair way.
+#
+#  Previous config backed up to {{ static_ip_backup_dir }}.
+# ============================================================================
+network:
+  version: 2
+  ethernets:
+    {{ _sip_iface }}:
+      dhcp4: false
+      dhcp6: {{ 'true' if static_ip_dhcp6 | bool else 'false' }}
+      {# No `set-name`: the renderer here is NetworkManager (see
+         01-network-manager-all.yaml), whose backend ignores it. Matching on the
+         MAC is enough to bind this config to the right NIC. #}
+      {% if _sip_macaddress | length > 0 %}
+      match:
+        macaddress: {{ _sip_macaddress }}
+      {% endif %}
+      addresses:
+        - {{ static_ip_address }}/{{ static_ip_prefix }}
+      {% if _sip_gateway | length > 0 %}
+      routes:
+        - to: default
+          via: {{ _sip_gateway }}
+      {% endif %}
+      {% if _sip_nameservers | length > 0 %}
+      nameservers:
+        addresses:
+          {% for ns in _sip_nameservers %}
+          - {{ ns }}
+          {% endfor %}
+        {% if _sip_search | length > 0 %}
+        search:
+          {% for s in _sip_search %}
+          - {{ s }}
+          {% endfor %}
+        {% endif %}
+      {% endif %}

@@ -1,0 +1,16 @@
+---
+# Ubuntu's installer leaves a `file:///cdrom` apt source behind. Once the ISO
+# is detached that repo has no Release file and apt fails hard, blocking all
+# package installation. Set to false to leave apt sources untouched.
+apt_disable_cdrom_sources: true
+
+# Enable IPv6 packet forwarding.
+#
+# Upstream requires only net.ipv4.ip_forward=1 for Kubernetes; IPv6 forwarding
+# is NOT needed for an IPv4-only cluster. It is on by default here so nodes are
+# ready for dual-stack, and because it is harmless when IPv6 is unused.
+#
+# Set to false if a node obtains its IPv6 address via SLAAC: with
+# forwarding=1 the kernel stops honouring router advertisements (unless
+# accept_ra=2) and the node can lose its IPv6 address.
+enable_ipv6_forwarding: true

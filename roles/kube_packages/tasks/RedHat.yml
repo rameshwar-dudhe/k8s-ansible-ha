@@ -1,0 +1,27 @@
+---
+- name: packages | RedHat | Add the Kubernetes repository
+  ansible.builtin.yum_repository:
+    name: kubernetes
+    description: "Kubernetes v{{ k8s_minor }}"
+    baseurl: "{{ _k8s_base }}/rpm/"
+    gpgcheck: true
+    gpgkey: "{{ _k8s_base }}/rpm/repodata/repomd.xml.key"
+    enabled: true
+    # Pinned here so a plain `dnf update` cannot drag the cluster forward.
+    exclude:
+      - kubelet
+      - kubeadm
+      - kubectl
+      - cri-tools
+      - kubernetes-cni
+
+- name: packages | RedHat | Install kubelet, kubeadm and kubectl
+  ansible.builtin.dnf:
+    name: >-
+      {{ ['kubelet', 'kubeadm', 'kubectl']
+         | map('regex_replace', '$', '-' ~ k8s_patch)
+         | list
+         if k8s_patch | length > 0
+         else ['kubelet', 'kubeadm', 'kubectl'] }}
+    state: present
+    disable_excludes: kubernetes

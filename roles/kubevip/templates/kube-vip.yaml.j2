@@ -1,0 +1,118 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+# ============================================================================
+#  kube-vip {{ kubevip_version }} static pod — managed by k8s-ansible-ha
+#  DO NOT EDIT BY HAND. Re-run the kubevip role instead.
+#
+#  Env var names verified against kube-vip v1.2.3 pkg/kubevip/config_envvar.go.
+#  Note: `vip_cidr` from the v0.x era no longer exists — it is `vip_subnet` now.
+# ============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-vip
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: kube-vip
+    app.kubernetes.io/managed-by: k8s-ansible-ha
+spec:
+  hostNetwork: true
+  priorityClassName: system-node-critical
+  # Lets kube-vip reach the API server through the VIP it is itself hosting
+  # during the window before the VIP is live.
+  hostAliases:
+    - ip: 127.0.0.1
+      hostnames:
+        - kubernetes
+  containers:
+    - name: kube-vip
+      image: ghcr.io/kube-vip/kube-vip:{{ kubevip_version }}
+      imagePullPolicy: IfNotPresent
+      args:
+        - manager
+      env:
+        - name: vip_arp
+          value: "{{ 'true' if kubevip_mode == 'arp' else 'false' }}"
+        - name: address
+          value: "{{ kubevip_vip }}"
+        - name: port
+          value: "{{ control_plane_port }}"
+        - name: vip_subnet
+          value: "{{ kubevip_vip_subnet }}"
+        - name: vip_interface
+          value: "{{ _kubevip_iface }}"
+        - name: vip_nodename
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+
+        # Control-plane load balancing (the reason we are here).
+        - name: cp_enable
+          value: "true"
+        - name: cp_namespace
+          value: kube-system
+
+        # Leader election — only one control plane holds the VIP at a time.
+        - name: vip_leaderelection
+          value: "true"
+        - name: vip_leasename
+          value: plndr-cp-lock
+        - name: vip_leaseduration
+          value: "15"
+        - name: vip_renewdeadline
+          value: "10"
+        - name: vip_retryperiod
+          value: "2"
+
+        # Optionally also serve type=LoadBalancer Services.
+        - name: svc_enable
+          value: "{{ 'true' if kubevip_svc_enable | bool else 'false' }}"
+        {% if kubevip_svc_enable | bool %}
+        - name: svc_election
+          value: "true"
+        {% endif %}
+
+        - name: vip_ddns
+          value: "false"
+        - name: vip_loglevel
+          value: "4"
+        - name: prometheus_server
+          value: ":2112"
+
+        {% if kubevip_mode == 'bgp' %}
+        # ── BGP mode ──────────────────────────────────────────────────────
+        - name: bgp_enable
+          value: "true"
+        - name: bgp_routerid
+          value: "{{ node_ip }}"
+        - name: bgp_as
+          value: "{{ kubevip_bgp_as }}"
+        - name: bgp_peeras
+          value: "{{ kubevip_bgp_peeras }}"
+        {% if kubevip_bgp_peers | length > 0 %}
+        - name: bgp_peers
+          value: "{{ kubevip_bgp_peers }}"
+        {% endif %}
+        {% endif %}
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN   # add/remove the VIP on the interface
+            - NET_RAW     # send gratuitous ARP
+            - SYS_TIME    # lease timing
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+      volumeMounts:
+        # Always mounted at admin.conf inside the container; the HOST path
+        # below is what changes between the init and steady-state passes.
+        - name: kubeconfig
+          mountPath: /etc/kubernetes/admin.conf
+          readOnly: true
+  volumes:
+    - name: kubeconfig
+      hostPath:
+        # super-admin.conf during `kubeadm init` (cluster-admin identity is
+        # required for the leases API), admin.conf once the cluster is up.
+        path: {{ kubevip_kubeconfig }}
+  status: {}

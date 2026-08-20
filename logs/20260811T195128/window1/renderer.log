@@ -1,0 +1,53 @@
+2026-08-11 19:51:32.385 [info] [AgentHost:renderer] Acquiring MessagePort to agent host...
+2026-08-11 19:51:32.421 [warning] Creation of workbench contribution 'workbench.contrib.agentHostPrewarm' took 26ms.
+2026-08-11 19:51:33.863 [info] [AgentHost:renderer] MessagePort acquired, creating client...
+2026-08-11 19:51:34.392 [info] Started local extension host with pid 10323.
+2026-08-11 19:51:34.547 [info] Started initializing default profile extensions in extensions installation folder. file:///root/.vscode/extensions
+2026-08-11 19:51:35.232 [warning] Failed to create default profile extensions manifest in extensions installation folder. file:///root/.vscode/extensions Unable to create file 'vscode-userdata:/root/.vscode/extensions/extensions.json' that already exists when overwrite flag is not set
+2026-08-11 19:51:35.232 [info] Completed initializing default profile extensions in extensions installation folder. file:///root/.vscode/extensions
+2026-08-11 19:51:35.267 [info] [AgentHost:renderer] Protocol connection established; clientId=95af8c9b-acba-426a-98b2-4a71ef070641
+2026-08-11 19:51:35.435 [error] [vscode.mermaid-markdown-features]: Extension 'vscode.mermaid-markdown-features' CANNOT use 'legacyToolReferenceFullNames' without the 'chatParticipantPrivate' API proposal enabled
+2026-08-11 19:51:35.763 [info] [AccountPolicyGate] apply: state=inactive, reason=undefined, isRestricted=false
+2026-08-11 19:51:38.593 [info] Settings Sync: Account status changed from uninitialized to unavailable
+2026-08-11 19:51:39.841 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.894 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.947 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.957 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.958 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.958 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.959 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.959 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.959 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.960 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.960 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.960 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.963 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.964 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.964 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.965 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.965 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.965 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.966 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.966 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.966 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.967 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.973 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.973 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.974 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.974 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.974 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.975 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.975 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.975 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.975 [info] [AgentHost] No token resolved for resource: https://api.github.com
+2026-08-11 19:51:39.979 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.979 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.979 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.980 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.980 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.990 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.990 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.991 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:39.991 [info] [AgentHost] No token resolved for resource: https://api.github.com/repos
+2026-08-11 19:51:40.764 [info] [AccountPolicyGate] apply: state=inactive, reason=undefined, isRestricted=false
+2026-08-11 19:51:41.475 [info] [perf] Render performance baseline is 56ms

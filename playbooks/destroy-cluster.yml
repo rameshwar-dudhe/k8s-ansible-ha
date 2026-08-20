@@ -1,0 +1,132 @@
+---
+# ============================================================================
+#  DESTRUCTIVE. Tears the cluster down and wipes all state.
+#
+#  Refuses to run without an explicit confirmation flag:
+#    ansible-playbook playbooks/destroy-cluster.yml -e confirm_destroy=yes
+#
+#  Also remove packages and the container runtime:
+#    ansible-playbook playbooks/destroy-cluster.yml -e confirm_destroy=yes \
+#                                                   -e reset_purge_packages=true
+#
+#  Teardown order is the reverse of build order: workers first, then secondary
+#  control planes, then the primary. Draining a node after its API server has
+#  gone is impossible, so the primary must be last.
+# ============================================================================
+
+- name: Import — safety guard (runs first, before any remote connection)
+  ansible.builtin.import_playbook: guard.yml
+
+- name: Confirm intent
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Require an explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - (confirm_destroy | default('')) | string | lower in ['yes', 'true']
+        fail_msg: |
+          Refusing to destroy the cluster without confirmation.
+          Re-run with:  -e confirm_destroy=yes
+        success_msg: "Confirmed — tearing down '{{ cluster_name }}'."
+        quiet: true
+
+    - name: State what is about to happen
+      ansible.builtin.debug:
+        msg:
+          - "About to RESET these nodes:"
+          - "  workers          : {{ groups['workers'] | default([]) | join(', ') | default('none', true) }}"
+          - "  extra masters    : {{ groups['master_secondary'] | default([]) | join(', ') | default('none', true) }}"
+          - "  primary master   : {{ groups['master_primary'] | default([]) | join(', ') | default('none', true) }}"
+          - "  purge packages   : {{ reset_purge_packages | default(false) }}"
+          - "NEVER touched      : {{ forbidden_hosts | join(', ') }}"
+
+# ─────────────────────────── 1. Drain what we can ──────────────────────────
+- name: Cordon and drain nodes while the API server still exists
+  hosts: master_primary
+  gather_facts: true
+  tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+
+    - name: Check the API server is still reachable
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o name
+      register: _api
+      changed_when: false
+      failed_when: false
+
+    - name: Drain every node
+      when: _api.rc == 0
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf drain {{ item | replace('node/', '') }}
+        --ignore-daemonsets --delete-emptydir-data --force --timeout=120s
+      loop: "{{ _api.stdout_lines | default([]) }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Note when the API server is already gone
+      when: _api.rc != 0
+      ansible.builtin.debug:
+        msg: "API server unreachable — skipping drain and going straight to reset."
+
+# ─────────────────────────── 2. Reset, in order ────────────────────────────
+- name: Reset workers
+  hosts: workers
+  gather_facts: true
+  any_errors_fatal: false
+  tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+    - name: Reset the node
+      ansible.builtin.import_role:
+        name: reset
+
+- name: Reset secondary control planes
+  hosts: master_secondary
+  gather_facts: true
+  any_errors_fatal: false
+  serial: 1
+  tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+    - name: Reset the node
+      ansible.builtin.import_role:
+        name: reset
+
+- name: Reset the primary control plane
+  hosts: master_primary
+  gather_facts: true
+  any_errors_fatal: false
+  tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+    - name: Reset the node
+      ansible.builtin.import_role:
+        name: reset
+
+# ─────────────────────────── 3. Clean up locally ───────────────────────────
+- name: Clean up control-node artifacts
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Remove the stored kubeconfig and join commands
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ artifacts_dir }}/admin.conf"
+        - "{{ artifacts_dir }}/join-commands.sh"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Cluster '{{ cluster_name }}' destroyed. Nodes are back to
+          {{ 'a bare OS' if (reset_purge_packages | default(false) | bool)
+             else 'packages-installed-but-no-cluster' }}.

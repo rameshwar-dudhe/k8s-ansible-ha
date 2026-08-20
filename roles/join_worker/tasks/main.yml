@@ -1,0 +1,160 @@
+---
+- name: join-worker | Check whether this node has already joined
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: _kubelet_conf
+
+- name: join-worker | Join the cluster
+  when: not _kubelet_conf.stat.exists
+  block:
+
+    # Tokens live 24h and certificate keys 2h, so always mint a fresh one from
+    # the primary rather than trusting whatever is in artifacts/.
+    - name: join-worker | Mint a fresh join command on the primary control plane
+      delegate_to: "{{ groups['master_primary'][0] }}"
+      ansible.builtin.command: kubeadm token create --print-join-command --ttl 2h
+      register: _join_cmd
+      changed_when: true
+
+    - name: join-worker | Run kubeadm join
+      ansible.builtin.command: >-
+        {{ _join_cmd.stdout | trim }}
+        --cri-socket {{ cri_socket }}
+        --node-name {{ inventory_hostname }}
+      register: _join
+      changed_when: true
+      async: 900
+      poll: 10
+
+  rescue:
+    - name: join-worker | Collect kubelet logs
+      ansible.builtin.command: journalctl -u kubelet --no-pager -n 60
+      register: _kubelet_log
+      changed_when: false
+      failed_when: false
+
+    - name: join-worker | Explain the failure
+      ansible.builtin.fail:
+        msg: >-
+          {{ (_join.stderr_lines | default([]))
+             + ['--- kubelet ---']
+             + (_kubelet_log.stdout_lines | default([])) }}
+
+- name: join-worker | Label the node as a worker
+  delegate_to: "{{ groups['master_primary'][0] }}"
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf label node
+    {{ inventory_hostname }} node-role.kubernetes.io/worker= --overwrite
+  changed_when: true
+
+- name: join-worker | Wait for the node to report Ready
+  delegate_to: "{{ groups['master_primary'][0] }}"
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf wait --for=condition=Ready
+    node/{{ inventory_hostname }} --timeout=300s
+  changed_when: false
+
+# ──────────────────────── CNI health on THIS node ──────────────────────────
+#  A Ready node is NOT proof of a working pod network. kubelet flips the node to
+#  Ready once a CNI config file exists on disk, so a CNI pod that writes its
+#  config and then dies leaves the node Ready and the join "successful".
+#
+#  This happened here: the Calico Installation is a single cluster-wide resource
+#  and was rendered with the primary control plane's address as a /32
+#  autodetection CIDR, so calico-node crashlooped on every worker with "failed
+#  to autodetect an IPv4 address" -- while the playbook reported failed=0. The
+#  CNI role's own `rollout status` check cannot catch it either: it runs during
+#  init-master, before any worker exists.
+- name: join-worker | Verify the CNI is actually running on this node
+  when:
+    - join_worker_verify_cni | bool
+    - cni in join_worker_cni_daemonsets
+  vars:
+    _cni_ns: "{{ join_worker_cni_daemonsets[cni].namespace }}"
+    _cni_ds: "{{ join_worker_cni_daemonsets[cni].daemonset }}"
+  delegate_to: "{{ groups['master_primary'][0] }}"
+  block:
+
+    # Read the selector from the DaemonSet instead of hardcoding pod labels:
+    # a wrong hardcoded label would match zero pods, and `kubectl wait` on zero
+    # pods is trivially satisfiable -- the check would pass while proving nothing.
+    - name: join-worker | Read the {{ cni }} DaemonSet's pod selector
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        -n {{ _cni_ns }} get daemonset {{ _cni_ds }}
+        -o jsonpath={.spec.selector.matchLabels}
+      register: _cni_ds_selector
+      changed_when: false
+
+    - name: join-worker | Build the label selector
+      ansible.builtin.set_fact:
+        _cni_selector: >-
+          {{ (_cni_ds_selector.stdout | from_json).items()
+             | map('join', '=') | join(',') }}
+
+    - name: join-worker | Confirm the selector resolved to something
+      ansible.builtin.assert:
+        that:
+          - _cni_selector | length > 0
+        fail_msg: >-
+          Could not read a pod selector from {{ _cni_ns }}/{{ _cni_ds }}. Refusing
+          to "verify" the CNI with an empty selector, which would match no pods
+          and pass regardless of whether the network works.
+        quiet: true
+
+    - name: join-worker | Wait for the {{ cni }} pod on {{ inventory_hostname }} to be Ready
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        wait --for=condition=Ready pod
+        -n {{ _cni_ns }} -l {{ _cni_selector }}
+        --field-selector spec.nodeName={{ inventory_hostname }}
+        --timeout=20s
+      register: _cni_pod_ready
+      changed_when: false
+      # `until` drives the retry; failure is reported by the assert below so the
+      # message can explain what a bare non-zero kubectl exit does not.
+      failed_when: false
+      retries: "{{ join_worker_cni_ready_retries }}"
+      delay: "{{ join_worker_cni_ready_delay }}"
+      until: _cni_pod_ready.rc == 0
+
+    - name: join-worker | Assert the pod network is genuinely up on this node
+      ansible.builtin.assert:
+        that:
+          - _cni_pod_ready.rc == 0
+        fail_msg: >-
+          {{ inventory_hostname }} reports Ready but its {{ cni }} pod
+          ({{ _cni_ns }}, {{ _cni_selector }}) never became Ready. The node has
+          no working pod network — anything scheduled there will fail. See the
+          diagnostics that follow.
+        success_msg: >-
+          {{ cni }} is Ready on {{ inventory_hostname }} — the pod network works.
+        quiet: true
+
+  rescue:
+    - name: join-worker | Describe the CNI pod on this node
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        -n {{ _cni_ns }} describe pod -l {{ _cni_selector | default('') }}
+        --field-selector spec.nodeName={{ inventory_hostname }}
+      register: _cni_describe
+      changed_when: false
+      failed_when: false
+
+    - name: join-worker | Collect the CNI pod's logs
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        -n {{ _cni_ns }} logs -l {{ _cni_selector | default('') }}
+        --field-selector spec.nodeName={{ inventory_hostname }}
+        --tail=40 --all-containers --prefix
+      register: _cni_logs
+      changed_when: false
+      failed_when: false
+
+    - name: join-worker | Explain the CNI failure
+      ansible.builtin.fail:
+        msg: >-
+          {{ ['--- describe (events at the end are usually the answer) ---']
+             + (_cni_describe.stdout_lines | default([]))[-25:]
+             + ['--- ' ~ cni ~ ' logs ---']
+             + (_cni_logs.stdout_lines | default([])) }}

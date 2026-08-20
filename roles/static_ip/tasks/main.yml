@@ -1,0 +1,375 @@
+---
+- name: static-ip | Pin the node address
+  when: static_ip_enabled | bool
+  block:
+
+    # ───────────────────────── Detect current settings ─────────────────────
+    - name: static-ip | Determine the interface
+      ansible.builtin.set_fact:
+        _sip_iface: >-
+          {{ static_ip_interface if static_ip_interface | length > 0
+             else (ansible_facts.default_ipv4.interface | default('')) }}
+
+    - name: static-ip | Determine the gateway
+      ansible.builtin.set_fact:
+        _sip_gateway: >-
+          {{ static_ip_gateway if static_ip_gateway | length > 0
+             else (ansible_facts.default_ipv4.gateway | default('')) }}
+
+    - name: static-ip | Read the real upstream resolvers
+      # /etc/resolv.conf is a 127.0.0.53 stub under systemd-resolved; writing
+      # that into netplan would point the box at its own loopback resolver.
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          if [ -r /run/systemd/resolve/resolv.conf ]; then
+            awk '/^nameserver/{print $2}' /run/systemd/resolve/resolv.conf \
+              | grep -v '^127\.' | head -3
+          else
+            awk '/^nameserver/{print $2}' /etc/resolv.conf \
+              | grep -v '^127\.' | head -3
+          fi
+      register: _sip_dns
+      changed_when: false
+
+    - name: static-ip | Read the search domain
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          for f in /run/systemd/resolve/resolv.conf /etc/resolv.conf; do
+            [ -r "$f" ] || continue
+            awk '/^(search|domain)/{for(i=2;i<=NF;i++) print $i}' "$f" | head -3
+            break
+          done
+      register: _sip_srch
+      changed_when: false
+
+    - name: static-ip | Read the interface MAC
+      ansible.builtin.set_fact:
+        _sip_macaddress: >-
+          {{ (ansible_facts[_sip_iface | replace('-', '_')].macaddress
+              | default('')) }}
+
+    - name: static-ip | Settle the final values
+      ansible.builtin.set_fact:
+        _sip_nameservers: >-
+          {{ static_ip_nameservers if static_ip_nameservers | length > 0
+             else (_sip_dns.stdout_lines | default([])) }}
+        _sip_search: >-
+          {{ static_ip_search if static_ip_search | length > 0
+             else (_sip_srch.stdout_lines | default([])) }}
+
+    - name: static-ip | Sanity-check what we are about to write
+      ansible.builtin.assert:
+        that:
+          - _sip_iface | length > 0
+          - _sip_gateway | length > 0
+          - static_ip_address | length > 0
+        fail_msg: >-
+          Refusing to rewrite the network config with incomplete values —
+          interface='{{ _sip_iface }}' gateway='{{ _sip_gateway }}'
+          address='{{ static_ip_address }}'. Set static_ip_interface /
+          static_ip_gateway explicitly.
+        quiet: true
+
+    - name: static-ip | Confirm the address is the one the node already holds
+      # Changing a control plane's IP post-init breaks certificate SANs and etcd
+      # peer URLs. Pinning must mean "keep what you have", not "move".
+      ansible.builtin.assert:
+        that:
+          - static_ip_address in ansible_facts.all_ipv4_addresses
+        fail_msg: >-
+          {{ inventory_hostname }} currently holds
+          {{ ansible_facts.all_ipv4_addresses | join(', ') }} but you asked to
+          pin {{ static_ip_address }}. Moving a node's address after the cluster
+          is built invalidates its certificates. Rebuild the cluster instead, or
+          set static_ip_force_move=true if you really mean it.
+        quiet: true
+      when: not (static_ip_force_move | default(false) | bool)
+
+    # ───────────────────── Duplicate address detection ─────────────────────
+    # The failure this catches: another host (a DHCP client that was handed this
+    # address while the node was down) answers NetworkManager's ARP probe at
+    # boot, NM aborts the connection, and the NIC comes up with no address.
+    # `netplan apply` does not reveal it, so it must be checked here.
+    - name: static-ip | Make sure arping is available
+      when: static_ip_conflict_check | bool
+      ansible.builtin.package:
+        name: "{{ 'iputils-arping' if ansible_facts.os_family == 'Debian' else 'iputils' }}"
+        state: present
+      failed_when: false
+
+    - name: static-ip | Check no other host answers for {{ static_ip_address }}
+      when: static_ip_conflict_check | bool
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          IFACE={{ _sip_iface | quote }}
+          ADDR={{ static_ip_address | quote }}
+          # Already ours? Then any ARP reply is our own -- nothing to detect.
+          if ip -4 -o addr show "$IFACE" | grep -q " $ADDR/"; then
+            echo "SELF (already held by this node)"
+          elif command -v arping >/dev/null 2>&1; then
+            if arping -D -q -c 3 -w 5 -I "$IFACE" "$ADDR"; then
+              echo "FREE"
+            else
+              echo "CONFLICT owner=$(arping -c 1 -w 2 -I "$IFACE" "$ADDR" 2>/dev/null \
+                | sed -n 's/.*\[\([0-9A-Fa-f:]*\)\].*/\1/p' | head -1)"
+            fi
+          elif ping -c 2 -W 1 "$ADDR" >/dev/null 2>&1; then
+            echo "CONFLICT (answered ICMP; arping unavailable)"
+          else
+            echo "FREE (ICMP probe only; arping unavailable)"
+          fi
+      register: _sip_dad
+      changed_when: false
+
+    - name: static-ip | Refuse to pin an address another host owns
+      when: static_ip_conflict_check | bool
+      ansible.builtin.assert:
+        that:
+          - "'CONFLICT' not in _sip_dad.stdout"
+        fail_msg: >-
+          {{ static_ip_address }} is already in use on this network —
+          {{ _sip_dad.stdout | trim }}. NetworkManager would fail the entire
+          connection at the next boot and leave {{ _sip_iface }} with no address
+          at all. Free that address, or pick one outside the DHCP pool.
+        success_msg: "{{ static_ip_address }} — {{ _sip_dad.stdout | trim }}"
+        quiet: true
+
+    - name: static-ip | Report the plan
+      ansible.builtin.debug:
+        msg:
+          - "interface   : {{ _sip_iface }} ({{ _sip_macaddress | default('no mac match') }})"
+          - "address     : {{ static_ip_address }}/{{ static_ip_prefix }} (static)"
+          - "gateway     : {{ _sip_gateway }}"
+          - "nameservers : {{ _sip_nameservers | join(', ') }}"
+          - "search      : {{ _sip_search | join(', ') | default('(none)', true) }}"
+          - "rollback    : auto-restore after {{ static_ip_rollback_seconds }}s if contact is lost"
+
+    # ───────────────────────────── Backup ──────────────────────────────────
+    - name: static-ip | Create the backup directory
+      ansible.builtin.file:
+        path: "{{ static_ip_backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: static-ip | Back up the existing netplan config
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          if [ ! -e "{{ static_ip_backup_dir }}/.captured" ]; then
+            cp -a /etc/netplan/. "{{ static_ip_backup_dir }}/" 2>/dev/null || true
+            touch "{{ static_ip_backup_dir }}/.captured"
+            echo BACKED-UP
+          else
+            echo ALREADY-BACKED-UP
+          fi
+      register: _sip_backup
+      changed_when: "'BACKED-UP' == (_sip_backup.stdout | trim)"
+
+    - name: static-ip | Confirm the backup is not empty before relying on it
+      # A backup of zero-byte files is worse than no backup: the rollback would
+      # "succeed" and leave /etc/netplan with empty configs, which silently
+      # disables netplan entirely and hands the NIC to NetworkManager's fallback
+      # profile. Observed in practice -- do not trust the copy blindly.
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          n=0
+          for f in {{ static_ip_backup_dir }}/*.yaml; do
+            [ -s "$f" ] && n=$((n+1))
+          done
+          echo "$n"
+      register: _sip_backup_ok
+      changed_when: false
+
+    - name: static-ip | Assert the backup holds real content
+      ansible.builtin.assert:
+        that:
+          - (_sip_backup_ok.stdout | trim | int) > 0
+        fail_msg: >-
+          {{ static_ip_backup_dir }} contains no non-empty *.yaml, so the
+          rollback timer would have nothing valid to restore. Refusing to touch
+          the network config. Inspect that directory by hand.
+        quiet: true
+
+    # ──────────────────────── Arm the rollback timer ───────────────────────
+    - name: static-ip | Arm the self-repair rollback timer
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          systemctl stop netplan-rollback.timer 2>/dev/null || true
+          systemd-run --unit=netplan-rollback \
+            --on-active={{ static_ip_rollback_seconds }} \
+            --timer-property=AccuracySec=1s \
+            /bin/bash -c '
+              # `cat >` rather than `cp -a`: cp -a has been seen to land
+              # zero-byte files here while preserving the source mtimes, so the
+              # wreckage looked like an untouched original. Copying content
+              # explicitly, then verifying it, is the whole point of a rollback.
+              rm -f /etc/netplan/*.yaml
+              for src in {{ static_ip_backup_dir }}/*.yaml; do
+                [ -e "$src" ] || continue
+                dst=/etc/netplan/$(basename "$src")
+                cat "$src" > "$dst"
+                chmod 600 "$dst"
+              done
+              sync
+              for src in {{ static_ip_backup_dir }}/*.yaml; do
+                [ -s "$src" ] || continue
+                dst=/etc/netplan/$(basename "$src")
+                if [ ! -s "$dst" ]; then
+                  logger -t netplan-rollback "restore of $dst came back empty — retrying"
+                  cat "$src" > "$dst"
+                  chmod 600 "$dst"
+                fi
+              done
+              rm -f /etc/netplan/.captured
+              netplan apply
+            '
+      changed_when: true
+
+    # ──────────────────────────── Apply ────────────────────────────────────
+    - name: static-ip | Write the static netplan config
+      ansible.builtin.template:
+        src: netplan-static.yaml.j2
+        dest: "{{ static_ip_netplan_file }}"
+        mode: "0600"
+        owner: root
+        group: root
+
+    - name: static-ip | Validate the config before applying it
+      ansible.builtin.command: netplan generate
+      changed_when: false
+
+    # Fire-and-forget: `netplan apply` can momentarily drop our own SSH session.
+    - name: static-ip | Apply the new network configuration
+      ansible.builtin.shell:
+        cmd: "sleep 2; netplan apply"
+      async: 90
+      poll: 0
+      changed_when: true
+
+    # When the address is CHANGING, the old one disappears the moment netplan
+    # applies, so every task after this must talk to the new address.
+    # Caution: never pass ansible_host as an extra-var for a move -- `-e` has
+    # higher precedence than set_fact and would silently pin the old address.
+    - name: static-ip | Point Ansible at the new address
+      ansible.builtin.set_fact:
+        ansible_host: "{{ static_ip_address }}"
+
+    # No `meta: reset_connection` here -- it does not honour `when`, and this
+    # whole block is conditional. Changing ansible_host above is enough: the
+    # next task opens a fresh connection because the target host differs.
+    - name: static-ip | Wait for the node to come back on {{ static_ip_address }}
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        sleep: 5
+        timeout: "{{ static_ip_rollback_seconds - 60 }}"
+
+    - name: static-ip | Re-gather facts over the new configuration
+      ansible.builtin.setup:
+        gather_subset: network
+
+    # ──────────────────────────── Verify ───────────────────────────────────
+    - name: static-ip | Confirm the address is present and no longer dynamic
+      ansible.builtin.shell:
+        cmd: "ip -4 -o addr show {{ _sip_iface }} | grep ' {{ static_ip_address }}/'"
+      register: _sip_check
+      changed_when: false
+
+    - name: static-ip | Assert the lease is gone
+      ansible.builtin.assert:
+        that:
+          - static_ip_address in ansible_facts.all_ipv4_addresses
+          - "'dynamic' not in _sip_check.stdout"
+        fail_msg: >-
+          {{ static_ip_address }} is still a DHCP lease:
+          {{ _sip_check.stdout | trim }}
+        success_msg: "{{ static_ip_address }} is now static."
+        quiet: true
+
+    - name: static-ip | Confirm the gateway is still reachable
+      ansible.builtin.command: "ping -c 2 -W 2 {{ _sip_gateway }}"
+      changed_when: false
+
+    - name: static-ip | Confirm DNS still resolves
+      ansible.builtin.command: "getent hosts {{ static_ip_dns_probe | default('archive.ubuntu.com') }}"
+      register: _sip_dnscheck
+      changed_when: false
+      failed_when: false
+
+    - name: static-ip | Warn if DNS resolution failed
+      when: _sip_dnscheck.rc != 0
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: name resolution failed after the change. Nameservers written
+          were {{ _sip_nameservers | join(', ') }}. The rollback timer is about
+          to be cancelled, so fix this manually or restore
+          {{ static_ip_backup_dir }} yourself.
+
+  # ───────────────────── Disarm, whatever happened ───────────────────────
+  always:
+    - name: static-ip | Cancel the rollback timer
+      when: static_ip_enabled | bool
+      ansible.builtin.shell:
+        cmd: |
+          systemctl stop netplan-rollback.timer 2>/dev/null || true
+          systemctl reset-failed netplan-rollback.timer 2>/dev/null || true
+          systemctl reset-failed netplan-rollback.service 2>/dev/null || true
+          echo disarmed
+      changed_when: false
+      # If we can no longer reach the node, this cannot run -- and that is
+      # exactly the case where the timer SHOULD be left to fire.
+      ignore_unreachable: true
+
+# ───────────────────────── Boot-time persistence ───────────────────────────
+# Deliberately OUTSIDE the block above, so it runs only after the rollback
+# timer has been disarmed: the timer is transient and cannot survive a reboot,
+# and leaving it armed across one risks it firing mid-test and reverting a
+# config that was actually fine.
+#
+# Verifying `netplan apply` alone is not enough. A config can apply cleanly and
+# still produce no address at boot -- NetworkManager's duplicate address
+# detection is one way, a MAC that no longer matches is another. This is the
+# check that turns "it worked when I ran it" into "it works when it boots".
+- name: static-ip | Prove the address survives a reboot
+  when:
+    - static_ip_enabled | bool
+    - static_ip_verify_reboot | bool
+  block:
+
+    - name: static-ip | Reboot the node
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        post_reboot_delay: 15
+        msg: "Rebooting to verify the static address persists (k8s-ansible-ha)"
+
+    - name: static-ip | Re-gather facts after the reboot
+      ansible.builtin.setup:
+        gather_subset: network
+
+    - name: static-ip | Read the address as it came up on its own
+      ansible.builtin.shell:
+        cmd: "ip -4 -o addr show {{ _sip_iface }} | grep ' {{ static_ip_address }}/'"
+      register: _sip_reboot_check
+      changed_when: false
+      failed_when: false
+
+    - name: static-ip | Assert the address is present, static, after a cold boot
+      ansible.builtin.assert:
+        that:
+          - _sip_reboot_check.rc == 0
+          - static_ip_address in ansible_facts.all_ipv4_addresses
+          - "'dynamic' not in _sip_reboot_check.stdout"
+        fail_msg: >-
+          {{ static_ip_address }} did not come back after the reboot —
+          {{ _sip_iface }} reports '{{ _sip_reboot_check.stdout | trim }}'. The
+          config applied but does not survive boot. Check
+          `journalctl -b -u NetworkManager` on the console for
+          'already in use' (address conflict) or a MAC mismatch.
+        success_msg: >-
+          {{ static_ip_address }} survived a reboot on {{ _sip_iface }} — the
+          address is genuinely persistent.
+        quiet: true

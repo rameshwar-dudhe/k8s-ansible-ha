@@ -1,0 +1,38 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+---
+# Calico Installation — managed by k8s-ansible-ha
+# Comments kept below the first `---` so no leading nil document is produced.
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    bgp: {{ 'Enabled' if calico_encapsulation in ['None', 'IPIPCrossSubnet', 'VXLANCrossSubnet'] else 'Disabled' }}
+    ipPools:
+      - name: default-ipv4-ippool
+        cidr: {{ pod_cidr }}
+        encapsulation: {{ calico_encapsulation }}
+        natOutgoing: Enabled
+        nodeSelector: all()
+    # Constrain autodetection so Calico does not pick a NAT / host-only
+    # interface at random on a multi-homed VM.
+    #
+    # This must be a NETWORK that covers every node, not a host address. The
+    # Installation is a single cluster-wide resource: a `{{ '{{ node_ip }}' }}/32` here
+    # renders the primary control plane's address and then calico-node dies on
+    # every other node with "failed to autodetect an IPv4 address", while the
+    # node still reports Ready because the CNI config file was written.
+    nodeAddressAutodetectionV4:
+      cidrs:
+      {% for _cidr in calico_autodetect_cidrs %}
+        - {{ _cidr }}
+      {% endfor %}
+  registry: quay.io/
+
+---
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}

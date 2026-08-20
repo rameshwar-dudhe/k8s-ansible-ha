@@ -1,0 +1,41 @@
+---
+# ============================================================================
+#  Bootstraps the FIRST control plane and installs the CNI.
+#  Runs against `master_primary` only — currently 192.168.56.134.
+#
+#    ansible-playbook playbooks/init-master.yml
+#    ansible-playbook playbooks/init-master.yml -e cni=cilium -e cri=crio
+# ============================================================================
+
+- name: Import — safety guard (runs first, before any remote connection)
+  ansible.builtin.import_playbook: guard.yml
+
+- name: Initialise the first control plane
+  hosts: master_primary
+  gather_facts: true
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+
+    - name: Refuse to run against more than one primary
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - groups['master_primary'] | length == 1
+        fail_msg: >-
+          `master_primary` must contain exactly one host — the node that runs
+          `kubeadm init`. Additional control planes belong in `master_secondary`
+          and are added with add-master.yml.
+        quiet: true
+
+  roles:
+    - role: common
+    - role: container_runtime
+    - role: kube_packages
+    # control_plane_init drives the kubevip role itself, twice: once against
+    # super-admin.conf before `kubeadm init`, then against admin.conf after.
+    - role: control_plane_init
+    - role: cni

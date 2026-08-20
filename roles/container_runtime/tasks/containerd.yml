@@ -1,0 +1,208 @@
+---
+# ============================================================================
+#  containerd from the Docker apt/dnf repo (containerd.io package).
+#  Distro-shipped containerd is usually too old and, on Ubuntu, ships with
+#  the CRI plugin disabled -- which makes kubeadm fail with a confusing
+#  "validate service connection" error.
+# ============================================================================
+
+# ─────────────────────────────── Debian ────────────────────────────────────
+- name: runtime | containerd | Debian | Create the keyring directory
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: runtime | containerd | Debian | Fetch the Docker GPG key
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.get_url:
+    url: "https://download.docker.com/linux/{{ ansible_facts.distribution | lower }}/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+    force: false
+
+# Docker lags new distro releases by weeks. Probe before committing to a suite,
+# otherwise `apt update` dies on a 404 and every later task fails obscurely.
+- name: runtime | containerd | Debian | Probe the Docker suite for this release
+  when:
+    - ansible_facts.os_family == 'Debian'
+    - containerd_docker_suite | length == 0
+  ansible.builtin.uri:
+    url: >-
+      https://download.docker.com/linux/{{ ansible_facts.distribution | lower }}/dists/{{ ansible_facts.distribution_release }}/Release
+    method: HEAD
+    status_code: [200, 403, 404]
+  register: _docker_suite_probe
+  failed_when: false
+
+- name: runtime | containerd | Debian | Choose the Docker suite
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.set_fact:
+    _docker_suite: >-
+      {{ containerd_docker_suite if containerd_docker_suite | length > 0
+         else (ansible_facts.distribution_release
+               if (_docker_suite_probe.status | default(0)) == 200
+               else containerd_docker_suite_fallback) }}
+
+- name: runtime | containerd | Debian | Note a suite fallback
+  when:
+    - ansible_facts.os_family == 'Debian'
+    - _docker_suite != ansible_facts.distribution_release
+  ansible.builtin.debug:
+    msg: >-
+      Docker has no '{{ ansible_facts.distribution_release }}' suite yet —
+      falling back to '{{ _docker_suite }}' packages.
+
+- name: runtime | containerd | Debian | Add the Docker repository
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ 'amd64' if ansible_facts.architecture == 'x86_64' else 'arm64' }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/{{ ansible_facts.distribution | lower }}
+      {{ _docker_suite }} stable
+    filename: docker
+    state: present
+    update_cache: true
+
+- name: runtime | containerd | Debian | Install containerd.io
+  when: ansible_facts.os_family == 'Debian'
+  ansible.builtin.apt:
+    name: containerd.io
+    state: present
+
+# ─────────────────────────────── RedHat ────────────────────────────────────
+- name: runtime | containerd | RedHat | Add the Docker repository
+  when: ansible_facts.os_family == 'RedHat'
+  ansible.builtin.yum_repository:
+    name: docker-ce-stable
+    description: Docker CE Stable
+    baseurl: "https://download.docker.com/linux/centos/{{ ansible_facts.distribution_major_version }}/$basearch/stable"
+    gpgcheck: true
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: true
+
+- name: runtime | containerd | RedHat | Install containerd.io
+  when: ansible_facts.os_family == 'RedHat'
+  ansible.builtin.dnf:
+    name: containerd.io
+    state: present
+
+# ──────────────────────────── Configuration ────────────────────────────────
+- name: runtime | containerd | Ensure the config directory exists
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    mode: "0755"
+
+# Deciding this properly matters. Docker's containerd.io package ships a STUB
+# /etc/containerd/config.toml whose entire content is `disabled_plugins = ["cri"]`.
+# Merely checking "does the file exist?" and skipping is wrong: the stub then
+# survives, the CRI plugin never loads, and kubeadm dies with
+#     unknown service runtime.v1.RuntimeService
+# which reads like a socket problem but is really a config problem.
+- name: runtime | containerd | Decide whether the config must be regenerated
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      f=/etc/containerd/config.toml
+      [ -f "$f" ] || { echo REGEN-absent; exit 0; }
+      # Stub config that disables CRI outright.
+      if grep -qE '^[[:space:]]*disabled_plugins[[:space:]]*=.*cri' "$f"; then
+        echo REGEN-cri-disabled; exit 0
+      fi
+      # A config with no SystemdCgroup key is also a stub -- there would be
+      # nothing for the cgroup-driver replacement below to act on.
+      grep -q 'SystemdCgroup' "$f" || { echo REGEN-stub; exit 0; }
+      echo KEEP
+  register: _ctr_decision
+  changed_when: false
+
+- name: runtime | containerd | Report the config decision
+  ansible.builtin.debug:
+    msg: >-
+      /etc/containerd/config.toml: {{ _ctr_decision.stdout | trim }}
+      {{ '(regenerating from `containerd config default`)'
+         if 'REGEN' in _ctr_decision.stdout else '(keeping existing)' }}
+
+# `containerd config default` emits the right schema for whichever containerd
+# major version is installed (v2 -> version=2, v3 -> version=3), so we never
+# have to guess at the plugin key layout.
+- name: runtime | containerd | Generate a full default config
+  when: >-
+    'REGEN' in (_ctr_decision.stdout | default(''))
+    or (containerd_force_config | bool)
+  ansible.builtin.shell:
+    cmd: containerd config default > /etc/containerd/config.toml
+  changed_when: true
+  notify: restart containerd
+
+# Belt and braces: even in a hand-maintained config, never leave CRI disabled.
+- name: runtime | containerd | Ensure no plugin is disabled
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '^(\s*)disabled_plugins\s*=\s*\[[^\]]*\]'
+    replace: '\1disabled_plugins = []'
+  notify: restart containerd
+
+- name: runtime | containerd | Use the systemd cgroup driver
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '(\s*)SystemdCgroup\s*=\s*false'
+    replace: '\1SystemdCgroup = true'
+  notify: restart containerd
+
+# The sandbox_image key moved between containerd v2 and v3
+# (io.containerd.grpc.v1.cri -> io.containerd.cri.v1.images). Matching on the
+# key name alone keeps this correct across both.
+- name: runtime | containerd | Pin the sandbox (pause) image
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '(\s*)sandbox_image\s*=\s*".*"'
+    replace: '\1sandbox_image = "{{ pause_image }}"'
+  notify: restart containerd
+
+- name: runtime | containerd | Enable and start containerd
+  ansible.builtin.systemd_service:
+    name: containerd
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: runtime | containerd | Apply pending restarts before continuing
+  ansible.builtin.meta: flush_handlers
+
+# The socket file existing proves nothing -- it is created even when the CRI
+# plugin is disabled. Ask containerd directly which plugins actually loaded.
+# `ctr` ships with containerd, so this works before cri-tools is installed.
+- name: runtime | containerd | Verify the CRI plugin actually loaded
+  ansible.builtin.shell:
+    cmd: ctr plugins ls 2>/dev/null | grep -iE '[[:space:]]cri|cri\.v1|grpc\.v1\.cri' || true
+  register: _cri_plugins
+  changed_when: false
+  retries: 6
+  delay: 5
+  # Plain substring tests, deliberately not regex: Jinja string literals apply
+  # Python escape processing, so '\bok\b' becomes a literal backspace character
+  # and never matches. Avoid backslashes in Jinja regex arguments entirely.
+  until:
+    - _cri_plugins.stdout | length > 0
+    - "'ok' in _cri_plugins.stdout"
+
+- name: runtime | containerd | Fail if any CRI plugin is in an error state
+  ansible.builtin.assert:
+    that:
+      - "'ok' in _cri_plugins.stdout"
+      - "'error' not in (_cri_plugins.stdout | lower)"
+    fail_msg: |
+      containerd's CRI plugin did not load. kubeadm will fail with
+      "unknown service runtime.v1.RuntimeService".
+
+      ctr plugins ls (cri rows):
+      {{ _cri_plugins.stdout }}
+
+      Check `disabled_plugins` in /etc/containerd/config.toml, or re-run with
+      -e containerd_force_config=true to regenerate it from scratch.
+    success_msg: "containerd CRI plugin loaded."
+    quiet: true
