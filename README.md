@@ -8,6 +8,29 @@ Requires **ansible-core only** — no Galaxy collections.
 
 ---
 
+## Tech stack / versions used
+
+| Layer | What | Version(s) |
+|---|---|---|
+| Orchestration | Ansible | ansible-core only, no Galaxy collections |
+| Kubernetes | kubeadm-built HA cluster | **v1.36** (`k8s_minor`, patch pinnable) |
+| Load balancer (control-plane VIP) | **kube-vip** | **v1.2.3**, ARP or BGP mode |
+| CNI (selectable) | Calico | **v3.32.1** (tigera-operator) |
+| | Cilium | **1.20.0** (CLI v0.19.7) |
+| | Weave Net (community fork) | v2.9.0 — archived upstream, use for reference only |
+| Container runtime (selectable) | containerd | 2.3.3 |
+| | CRI-O | 1.36.3 |
+| kube-proxy mode | nftables (default) / iptables / ipvs / none | — |
+| OS support | Ubuntu, RHEL, Rocky | auto-detected, no manual switch |
+| HA topology | 1–4 control planes + N workers | odd control-plane count enforced |
+
+Everything above is a variable in `inventory/group_vars/all.yml` — swap CNI,
+runtime, or kube-proxy mode with a single `-e` flag, no code changes. See
+[Options](#options) and [Tested combinations](#tested-combinations) below for
+what's actually been built and verified, not just supported on paper.
+
+---
+
 ## Safety: 192.168.56.133 is never touched
 
 This repo is hard-wired to refuse to operate on `192.168.56.133`.
