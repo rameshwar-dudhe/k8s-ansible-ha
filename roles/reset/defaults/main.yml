@@ -1,4 +1,7 @@
 ---
-# Also remove kubeadm/kubelet/kubectl and the container runtime, not just
-# the cluster state.
-reset_purge_packages: false
+# Also remove kubeadm/kubelet/kubectl and the container runtime packages,
+# not just the cluster state — the node ends up as if it never ran
+# Kubernetes at all. Default true so a plain `destroy-cluster.yml` with no
+# extra flags does a full cleanup. Pass `-e reset_purge_packages=false` to
+# keep packages installed for a faster next rebuild instead.
+reset_purge_packages: true
