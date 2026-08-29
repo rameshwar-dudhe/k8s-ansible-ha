@@ -65,6 +65,7 @@
           - "runtime      : {{ cri }}"
           - "cni          : {{ cni }}"
           - "kube-proxy   : {{ kube_proxy_mode }}"
+          - "gateway api  : {{ ('enabled — ' ~ gateway_api_version ~ ' / ' ~ gateway_api_channel ~ ' channel, impl=' ~ cni ~ ' (' ~ gateway_api_expose ~ ')') if gateway_api_enabled else 'disabled' }}"
           - "pod cidr     : {{ pod_cidr }}"
           - "service cidr : {{ service_cidr }}"
           - "kube-vip     : {{ 'enabled — ' ~ kubevip_vip ~ ' (' ~ kubevip_mode ~ ')' if kubevip_enabled else 'disabled' }}"

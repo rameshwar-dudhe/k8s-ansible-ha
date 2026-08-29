@@ -44,11 +44,79 @@
     {% else %}
     --set kubeProxyReplacement=false
     {% endif %}
+    {% if gateway_api_enabled | default(false) | bool %}
+    --set gatewayAPI.enabled=true
+    {% if gateway_api_expose == 'hostNetwork' %}
+    --set gatewayAPI.hostNetwork.enabled=true
+    {# Host-netns Envoy needs NET_BIND_SERVICE to bind a Gateway listener on a #}
+    {# privileged port (80/443); without it Envoy NACKs the listener in a tight #}
+    {# xDS loop that starves the agent. See playbooks/deploy-gateway-api.yml. #}
+    --set envoy.securityContext.capabilities.keepCapNetBindService=true
+    --set envoy.securityContext.capabilities.envoy={NET_ADMIN,SYS_ADMIN,NET_BIND_SERVICE}
+    {% endif %}
+    {% endif %}
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   changed_when: true
   # operator.replicas=1 because a fresh single-control-plane cluster cannot
   # satisfy the default 2-replica anti-affinity and the install would hang.
+
+# Re-run path: Cilium is already installed but Gateway API was turned on since.
+# A from-scratch build never enters this (the install above already carries the
+# flags). Retrofitting a kube-proxy cluster is deploy-gateway-api.yml's job —
+# it also removes kube-proxy and flushes node rules, which this does NOT.
+- name: cni | cilium | Check whether Gateway API is already enabled on Cilium
+  when:
+    - _cilium_present.rc == 0
+    - gateway_api_enabled | default(false) | bool
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system get configmap cilium-config
+    -o jsonpath={.data.enable-gateway-api}
+  register: _cilium_gwapi
+  changed_when: false
+  failed_when: false
+
+- name: cni | cilium | Enable Gateway API on the running Cilium install
+  when:
+    - _cilium_present.rc == 0
+    - gateway_api_enabled | default(false) | bool
+    - (_cilium_gwapi.stdout | default('')) != 'true'
+  ansible.builtin.command: >-
+    cilium upgrade --version {{ cilium_version }} --reuse-values
+    --set gatewayAPI.enabled=true
+    {% if gateway_api_expose == 'hostNetwork' %}
+    --set gatewayAPI.hostNetwork.enabled=true
+    --set envoy.securityContext.capabilities.keepCapNetBindService=true
+    --set envoy.securityContext.capabilities.envoy={NET_ADMIN,SYS_ADMIN,NET_BIND_SERVICE}
+    {% endif %}
+    {% if kube_proxy_mode == 'none' %}
+    --set kubeProxyReplacement=true
+    --set k8sServiceHost={{ control_plane_endpoint }}
+    --set k8sServicePort={{ control_plane_port }}
+    {% endif %}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: true
+
+- name: cni | cilium | Warn if kube-proxy is still present after enabling replacement
+  when:
+    - _cilium_present.rc == 0
+    - gateway_api_enabled | default(false) | bool
+    - kube_proxy_mode == 'none'
+  ansible.builtin.shell:
+    cmd: >-
+      {{ _kubectl }} -n kube-system get daemonset kube-proxy
+      --ignore-not-found -o name
+  register: _kp_ds
+  changed_when: false
+
+- name: cni | cilium | Note that kube-proxy needs a proper migration
+  when: (_kp_ds.stdout | default('')) | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      kube-proxy DaemonSet is still running alongside Cilium's kube-proxy
+      replacement. Run playbooks/deploy-gateway-api.yml to remove it and flush
+      its stale dataplane rules — do NOT leave both programming the dataplane.
 
 - name: cni | cilium | Wait for Cilium to become ready
   ansible.builtin.command: cilium status --wait --wait-duration 10m
