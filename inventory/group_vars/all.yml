@@ -53,6 +53,14 @@ service_cidr: "10.96.0.0/12"
 # `imageMinimumGCAge`). Default upstream is 2m.
 kubelet_image_gc_age: "3h"
 
+# destroy-cluster.yml with no extra flags does a FULL cleanup: packages,
+# container runtime and its data store all removed, node ends up as if it
+# never ran Kubernetes. Set globally (not just in roles/reset/defaults) so
+# the localhost summary tasks in destroy-cluster.yml see the same value the
+# reset role uses on the actual nodes. Pass `-e reset_purge_packages=false`
+# to keep packages installed for a faster next rebuild instead.
+reset_purge_packages: true
+
 # nftables | iptables | ipvs | none
 #
 #   nftables - stable/GA since Kubernetes v1.33 and the mode upstream now

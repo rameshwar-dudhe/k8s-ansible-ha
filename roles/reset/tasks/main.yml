@@ -2,7 +2,14 @@
 # ============================================================================
 #  Tears a node back down to "packages installed, no cluster".
 #  Set `reset_purge_packages=true` to also remove kubeadm/kubelet/kubectl
-#  and the container runtime.
+#  and the container runtime packages themselves.
+#
+#  The container runtime's data store (containers, sandboxes, cached images)
+#  is always wiped, regardless of that flag -- kubeadm's static-pod identities
+#  are deterministic per node, so a runtime that keeps its old attempt/
+#  generation history around reports a misleadingly inflated RESTARTS count
+#  on the very first start of a freshly rebuilt cluster. The trade-off is a
+#  cold image cache: every rebuild re-pulls from scratch.
 # ============================================================================
 
 - name: reset | Announce
@@ -11,37 +18,14 @@
       Resetting {{ inventory_hostname }} ({{ node_ip | default(ansible_host) }})
       — purge_packages={{ reset_purge_packages | bool }}
 
-# Remove the static pod first, so kube-vip drops the VIP before the API server
-# it depends on goes away.
-- name: reset | Remove the kube-vip static pod manifest
-  ansible.builtin.file:
-    path: /etc/kubernetes/manifests/kube-vip.yaml
-    state: absent
-
-- name: reset | Release the VIP from the interface if it is still held
-  when: kubevip_enabled | bool
-  ansible.builtin.shell:
-    cmd: |
-      set -e
-      iface=$(ip -4 -o addr show | awk '$4 ~ /^{{ kubevip_vip }}\// {print $2; exit}')
-      if [ -n "$iface" ]; then
-        ip addr del {{ kubevip_vip }}/{{ kubevip_vip_subnet }} dev "$iface"
-        echo "released"
-      fi
-  register: _vip_release
-  changed_when: "'released' in (_vip_release.stdout | default(''))"
-  failed_when: false
-
-- name: reset | Check whether kubeadm has anything to reset
-  ansible.builtin.stat:
-    path: /etc/kubernetes/kubelet.conf
-  register: _kubelet_conf
-
 # The cluster may have been built with a different runtime than `cri` currently
 # says — e.g. built with `-e cri=crio` but torn down with the default. Passing
 # the wrong --cri-socket means kubeadm cannot stop or remove the running
 # containers, and the teardown leaves the node dirty. Ask kubelet what it is
 # actually using rather than trusting the variable.
+#
+# Detected BEFORE the kube-vip teardown below, because that teardown needs the
+# socket too (to kill the container directly rather than waiting on kubelet).
 - name: reset | Detect the CRI socket the cluster was actually built with
   ansible.builtin.shell:
     cmd: |
@@ -73,6 +57,83 @@
       {{ '(detected from kubelet)'
          if (_detected_sock.stdout | trim | length) > 0
          else '(fell back to cri=' ~ cri ~ ')' }}
+
+# Remove the static pod manifest first, so kubelet stops trying to keep it
+# alive — but that alone only SCHEDULES the stop; kube-vip is still a live
+# process at this point (kubeadm reset, which tears down the API server it
+# leader-elects against, hasn't run yet). If we jump straight to `ip addr del`
+# while it is still running, kube-vip's own leaderelection/ARP loop can win the
+# race and put the address right back before kubelet finally kills it, so the
+# VIP is left assigned even though the cluster is gone. Kill the container
+# directly via crictl instead of waiting on kubelet's poll loop, THEN release
+# the address, THEN verify it actually stayed released.
+- name: reset | Remove the kube-vip static pod manifest
+  ansible.builtin.file:
+    path: /etc/kubernetes/manifests/kube-vip.yaml
+    state: absent
+
+- name: reset | Find the running kube-vip container, if any
+  when: kubevip_enabled | bool
+  ansible.builtin.shell:
+    cmd: >-
+      crictl --runtime-endpoint {{ _reset_cri_socket }}
+      ps -q --name kube-vip --state Running 2>/dev/null || true
+  register: _vip_container
+  changed_when: false
+  failed_when: false
+
+- name: reset | Force-kill the kube-vip container so it cannot reassert the VIP
+  when:
+    - kubevip_enabled | bool
+    - _vip_container.stdout | trim | length > 0
+  ansible.builtin.shell:
+    cmd: |
+      for id in {{ _vip_container.stdout | trim | replace('\n', ' ') }}; do
+        crictl --runtime-endpoint {{ _reset_cri_socket }} stop --timeout 5 "$id" 2>/dev/null || true
+        crictl --runtime-endpoint {{ _reset_cri_socket }} rm -f "$id" 2>/dev/null || true
+      done
+  changed_when: true
+  failed_when: false
+
+- name: reset | Release the VIP from the interface, verifying it stays gone
+  when: kubevip_enabled | bool
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      still_held() {
+        ip -4 -o addr show | awk '$4 ~ /^{{ kubevip_vip }}\// {print $2; exit}'
+      }
+      removed_once=0
+      for _ in 1 2 3 4 5; do
+        iface=$(still_held)
+        [ -z "$iface" ] && break
+        ip addr del {{ kubevip_vip }}/{{ kubevip_vip_subnet }} dev "$iface" 2>/dev/null || true
+        removed_once=1
+        sleep 1
+      done
+      if [ -n "$(still_held)" ]; then
+        echo "STILL-HELD on $(still_held)"
+      elif [ "$removed_once" -eq 1 ]; then
+        echo "released"
+      else
+        echo "already-clear"
+      fi
+  register: _vip_release
+  changed_when: "'released' in (_vip_release.stdout | default(''))"
+  failed_when: false
+
+- name: reset | Warn when the VIP could not be fully released
+  when: "'STILL-HELD' in (_vip_release.stdout | default(''))"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ kubevip_vip }} is still assigned on {{ inventory_hostname }}
+      after 5 release attempts ({{ _vip_release.stdout | trim }}). Check
+      manually with `ip addr show | grep {{ kubevip_vip }}`.
+
+- name: reset | Check whether kubeadm has anything to reset
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: _kubelet_conf
 
 - name: reset | Run kubeadm reset
   when: _kubelet_conf.stat.exists
@@ -133,6 +194,16 @@
     - /opt/cni/bin/calico
     - /opt/cni/bin/cilium-cni
     - /root/.kube
+    # kubeadm's static-pod UIDs are deterministic per node (a hash of node
+    # name + pod name), so a rebuilt cluster reuses the EXACT same log
+    # directory path kubelet used last time. Kubelet picks each container's
+    # next "attempt" number by scanning this directory for the highest
+    # existing <N>.log file and continuing past it -- entirely independent
+    # of the CRI/containerd state wiped above. Without this, RESTARTS keeps
+    # climbing across every rebuild no matter how thoroughly the runtime
+    # itself is cleaned.
+    - /var/log/pods
+    - /var/log/containers
 
 - name: reset | Report any directory that could not be removed
   when: _reset_rm.results | default([]) | selectattr('failed', 'defined')
@@ -195,13 +266,51 @@
   changed_when: "'flushed' in (_ipt.stdout | default(''))"
   failed_when: false
 
-- name: reset | Restart the container runtime to clear stale sandboxes
-  # Derived from the DETECTED socket, not the `cri` variable — same reason as
-  # the kubeadm reset above.
+# kubeadm's static-pod names/UIDs are deterministic per node (etcd-k8s-cp-0
+# always hashes the same), and the runtime's own attempt/generation counter
+# for a given pod+container identity is a persistent internal sequence, kept
+# in its metadata store on disk -- it does NOT reset just because the
+# container/sandbox objects themselves are deleted (`crictl rm/rmp --force`
+# was tried and confirmed: it removes the objects but the next build's
+# attempt numbers still continue climbing from the old count). The only way
+# to actually get a clean RESTARTS=0 after a rebuild is to wipe that store,
+# so we do it unconditionally on every reset, not just under
+# `reset_purge_packages`. Trade-off: every rebuild re-pulls images from
+# scratch instead of reusing a cache — accepted deliberately for a
+# consistently clean restart count over a faster rebuild.
+- name: reset | Stop the container runtime before wiping its data store
   ansible.builtin.systemd_service:
     name: "{{ 'crio' if 'crio' in _reset_cri_socket else 'containerd' }}"
-    state: restarted
+    state: stopped
   failed_when: false
+
+- name: reset | Wipe the container runtime's data store (containers, sandboxes, cached images)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/lib/containerd
+    - /var/lib/containers
+
+- name: reset | Start the container runtime with a clean data store
+  # No systemd unit to start is a legitimate state here, not a failure -- e.g.
+  # a prior purge removed the runtime entirely, or a runtime switch (cri=X ->
+  # cri=Y) never got past a failed package install. Either way there's
+  # nothing running to leave dirty, and the container_runtime role installs
+  # and starts the runtime fresh on the next create-cluster.yml regardless.
+  ansible.builtin.systemd_service:
+    name: "{{ 'crio' if 'crio' in _reset_cri_socket else 'containerd' }}"
+    state: started
+  register: _runtime_start
+  failed_when: false
+
+- name: reset | Note that no container runtime service exists to start
+  when: _runtime_start is failed
+  ansible.builtin.debug:
+    msg: >-
+      No {{ 'crio' if 'crio' in _reset_cri_socket else 'containerd' }}
+      systemd service found on {{ inventory_hostname }} — nothing was running,
+      so this is a no-op. The next create-cluster.yml installs it fresh.
 
 # ─────────────────────────── Optional package purge ────────────────────────
 - name: reset | Purge Kubernetes and runtime packages
@@ -232,7 +341,27 @@
         autoremove: true
       failed_when: false
 
-    - name: reset | Remove leftover binaries and config
+    - name: reset | Debian | Remove the apt repositories and signing keys we added
+      when: ansible_facts.os_family == 'Debian'
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - /etc/apt/keyrings/docker.asc
+
+    - name: reset | RedHat | Remove the yum repositories we added
+      when: ansible_facts.os_family == 'RedHat'
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/yum.repos.d/kubernetes.repo
+        - /etc/yum.repos.d/docker-ce-stable.repo
+
+    - name: reset | Remove leftover binaries, config and runtime data stores
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
@@ -242,6 +371,8 @@
         - /etc/crio
         - /etc/crictl.yaml
         - /usr/local/bin/cilium
+        # /var/lib/containerd and /var/lib/containers are already wiped
+        # unconditionally earlier in this role, regardless of this flag.
 
 - name: reset | Done
   ansible.builtin.debug:
