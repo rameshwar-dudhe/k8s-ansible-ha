@@ -80,6 +80,8 @@ cgroupDriver: systemd
 # Detected in the common role. On a systemd-resolved host /etc/resolv.conf is a
 # stub pointing at 127.0.0.53; handing that to CoreDNS creates a resolution loop.
 resolvConf: {{ kubelet_resolv_conf }}
+# How long an unreferenced image sits before it is eligible for GC.
+imageMinimumGCAge: {{ kubelet_image_gc_age }}
 
 {% if kube_proxy_mode != 'none' %}
 ---

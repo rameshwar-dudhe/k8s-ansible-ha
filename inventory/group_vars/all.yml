@@ -48,6 +48,11 @@ cluster_name: "k8s-ha"
 pod_cidr: "10.244.0.0/16"
 service_cidr: "10.96.0.0/12"
 
+# How long an unreferenced image must sit unused before kubelet's image
+# garbage collector is allowed to evict it (KubeletConfiguration
+# `imageMinimumGCAge`). Default upstream is 2m.
+kubelet_image_gc_age: "3h"
+
 # nftables | iptables | ipvs | none
 #
 #   nftables - stable/GA since Kubernetes v1.33 and the mode upstream now
