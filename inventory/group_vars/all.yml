@@ -39,19 +39,32 @@ allowed_hosts:
   - "192.168.56.141"
 
 # ─────────────────────────── Kubernetes ────────────────────────────────────
-k8s_minor: "1.36"          # package repo stream: pkgs.k8s.io/core:/stable:/v1.36
-k8s_patch: ""              # "" = newest patch in the minor (1.36.3 as of Aug 2026)
-                           # or pin exactly, e.g. "1.36.3"
-k8s_deb_revision: "1.1"    # deb version suffix -> kubeadm=1.36.1-1.1
+k8s_minor: "1.37"          # package repo stream: pkgs.k8s.io/core:/stable:/v1.37
+k8s_patch: ""              # "" = newest patch in the minor (1.37.0 as of Aug 2026)
+                           # or pin exactly, e.g. "1.37.0"
+k8s_deb_revision: "1.1"    # deb version suffix -> kubeadm=1.37.0-1.1
 
 cluster_name: "k8s-ha"
 pod_cidr: "10.244.0.0/16"
 service_cidr: "10.96.0.0/12"
 
+# How long an unreferenced image must sit unused before kubelet's image
+# garbage collector is allowed to evict it (KubeletConfiguration
+# `imageMinimumGCAge`). Default upstream is 2m.
+kubelet_image_gc_age: "3h"
+
+# destroy-cluster.yml with no extra flags does a FULL cleanup: packages,
+# container runtime and its data store all removed, node ends up as if it
+# never ran Kubernetes. Set globally (not just in roles/reset/defaults) so
+# the localhost summary tasks in destroy-cluster.yml see the same value the
+# reset role uses on the actual nodes. Pass `-e reset_purge_packages=false`
+# to keep packages installed for a faster next rebuild instead.
+reset_purge_packages: true
+
 # nftables | iptables | ipvs | none
 #
 #   nftables - stable/GA since Kubernetes v1.33 and the mode upstream now
-#              recommends for Linux. Default here.
+#              recommends for Linux. Default when Gateway API is off.
 #   iptables - the traditional upstream default. Still fully supported, and the
 #              only mode where NodePort answers on 127.0.0.1.
 #   ipvs     - DEPRECATED in Kubernetes v1.35. kube-proxy logs a warning on
@@ -59,8 +72,13 @@ service_cidr: "10.96.0.0/12"
 #              v1.43. Selectable, but the common role warns when you use it.
 #   none     - kube-proxy is skipped entirely (only valid with cni=cilium)
 #
+# DERIVED: Cilium's Gateway API controller only runs with the kube-proxy
+# replacement, so `gateway_api_enabled` forces this to `none`. Override on the
+# CLI (`-e kube_proxy_mode=nftables`) still wins, but the gateway_api role then
+# hard-aborts the mismatch. With gateway_api_enabled=false this is `nftables`.
+#
 # Ref: https://kubernetes.io/docs/reference/networking/virtual-ips/
-kube_proxy_mode: "nftables"
+kube_proxy_mode: "{{ 'none' if (gateway_api_enabled | default(false) | bool) else 'nftables' }}"
 
 # Which local addresses accept NodePort traffic (cluster-wide kube-proxy setting).
 #
@@ -83,8 +101,11 @@ kube_proxy_nodeport_addresses: []
 remove_control_plane_taint: false
 
 # ────────────────────────── Container runtime ──────────────────────────────
-cri: "containerd"          # containerd | crio
-crio_minor: "1.36"         # CRI-O stream, keep aligned with k8s_minor
+cri: "crio"                # containerd | crio
+crio_minor: "1.36"         # CRI-O stream. Normally kept aligned with k8s_minor,
+                           # but pinned one minor behind here: the isv:cri-o
+                           # stable stream has no v1.37 yet (v1.34-v1.36 only).
+                           # CRI-O tolerates an n-1 skew against the kubelet.
 pause_image: "registry.k8s.io/pause:3.10"
 
 cri_socket: >-
@@ -92,8 +113,26 @@ cri_socket: >-
      if cri == 'containerd'
      else 'unix:///run/crio/crio.sock' }}
 
+# ───────────────────────────── Gateway API ─────────────────────────────────
+# Install the Kubernetes Gateway API and wire Cilium up as the implementation.
+#
+#   true  -> gateway_api role applies the CRDs; the cni role enables
+#            gatewayAPI.enabled on Cilium; kube_proxy_mode is forced to `none`
+#            (Cilium takes over what kube-proxy did).
+#   false -> nothing Gateway-API-related is installed; kube-proxy stays.
+#
+# A cluster built from scratch with this true needs no extra steps. To retrofit
+# a cluster that ALREADY has kube-proxy, run playbooks/deploy-gateway-api.yml —
+# it also removes kube-proxy and flushes its stale dataplane rules.
+#
+# Full knob set + channel/version notes: roles/gateway_api/defaults/main.yml
+gateway_api_enabled: true
+gateway_api_version: "v1.6.1"       # kubernetes-sigs/gateway-api release
+gateway_api_channel: "standard"     # standard | experimental
+gateway_api_expose: "hostNetwork"   # hostNetwork | loadbalancer
+
 # ───────────────────────────────  CNI  ──────────────────────────────────────
-cni: "calico"              # calico | cilium | weavenet
+cni: "cilium"              # calico | cilium | weavenet
 
 calico_version: "v3.32.1"      # tigera-operator driven
 calico_encapsulation: "VXLANCrossSubnet"   # VXLAN | IPIP | VXLANCrossSubnet | None

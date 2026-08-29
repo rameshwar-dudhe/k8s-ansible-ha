@@ -5,9 +5,14 @@
 #  Refuses to run without an explicit confirmation flag:
 #    ansible-playbook playbooks/destroy-cluster.yml -e confirm_destroy=yes
 #
-#  Also remove packages and the container runtime:
+#  That alone is a FULL cleanup by default: packages (kubelet/kubeadm/kubectl),
+#  the container runtime and its whole data store (containers, sandboxes,
+#  cached images) are all removed — nodes end up as if they never ran
+#  Kubernetes. No extra flag needed.
+#
+#  To keep packages installed instead, for a faster next rebuild:
 #    ansible-playbook playbooks/destroy-cluster.yml -e confirm_destroy=yes \
-#                                                   -e reset_purge_packages=true
+#                                                   -e reset_purge_packages=false
 #
 #  Teardown order is the reverse of build order: workers first, then secondary
 #  control planes, then the primary. Draining a node after its API server has
@@ -39,7 +44,7 @@
           - "  workers          : {{ groups['workers'] | default([]) | join(', ') | default('none', true) }}"
           - "  extra masters    : {{ groups['master_secondary'] | default([]) | join(', ') | default('none', true) }}"
           - "  primary master   : {{ groups['master_primary'] | default([]) | join(', ') | default('none', true) }}"
-          - "  purge packages   : {{ reset_purge_packages | default(false) }}"
+          - "  purge packages   : {{ reset_purge_packages | default(true) }}"
           - "NEVER touched      : {{ forbidden_hosts | join(', ') }}"
 
 # ─────────────────────────── 1. Drain what we can ──────────────────────────
@@ -128,5 +133,5 @@
       ansible.builtin.debug:
         msg: >-
           Cluster '{{ cluster_name }}' destroyed. Nodes are back to
-          {{ 'a bare OS' if (reset_purge_packages | default(false) | bool)
+          {{ 'a bare OS' if (reset_purge_packages | default(true) | bool)
              else 'packages-installed-but-no-cluster' }}.
