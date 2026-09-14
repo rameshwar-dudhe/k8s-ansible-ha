@@ -25,3 +25,13 @@
          else ['kubelet', 'kubeadm', 'kubectl'] }}
     state: present
     disable_excludes: kubernetes
+
+# crictl (cri-tools) comes only from the Kubernetes repo above, which excludes
+# it from routine updates, so install it with the excludes lifted, just like
+# kubelet/kubeadm/kubectl. See Debian.yml for why it lives here and not in
+# container_runtime.
+- name: packages | RedHat | Install cri-tools (crictl)
+  ansible.builtin.dnf:
+    name: cri-tools
+    state: present
+    disable_excludes: kubernetes

@@ -46,6 +46,17 @@
     allow_change_held_packages: true
     update_cache: true
 
+# crictl (cri-tools) is published ONLY in the pkgs.k8s.io repo added above.
+# The CRI-O repo does not carry it, and kubeadm's 1.37 package has no
+# dependencies, so nothing pulls it in. It used to be installed by the
+# container_runtime role, which runs BEFORE this repo exists: on a fresh node
+# apt found no candidate, `failed_when: false` hid that, and crictl was missing.
+# Install it here, after the repo, and let a failure fail.
+- name: packages | Debian | Install cri-tools (crictl)
+  ansible.builtin.apt:
+    name: cri-tools
+    state: present
+
 - name: packages | Debian | Hold the packages at the installed version
   ansible.builtin.dpkg_selections:
     name: "{{ item }}"

@@ -44,15 +44,10 @@
       Leaving containerd running on {{ inventory_hostname }} — Docker is active
       and depends on it. kubelet still uses {{ cri }}; containerd is simply idle.
 
-# crictl is the CRI debugging tool upstream's docs use. It arrives as a kubeadm
-# dependency on some distros but NOT with the CRI-O package, so install it
-# explicitly rather than writing a config file for a binary that may not exist.
-- name: runtime | Install cri-tools (crictl)
-  ansible.builtin.package:
-    name: cri-tools
-    state: present
-  failed_when: false
-
+# crictl (cri-tools) is installed by the kube_packages role, right after it adds
+# the pkgs.k8s.io repo — the only repo that publishes it. Installing it here, as
+# this role used to, silently failed on fresh nodes because that repo does not
+# exist yet. The config file below is harmless before the binary arrives.
 - name: runtime | Point crictl at {{ cri }}
   ansible.builtin.copy:
     dest: /etc/crictl.yaml
@@ -64,9 +59,8 @@
       timeout: 10
       debug: false
 
-# NOTE: deliberately not using `crictl` here. crictl arrives with the
-# cri-tools package, which is pulled in as a kubeadm dependency by the
-# kube_packages role -- which runs *after* this one. Check the socket directly.
+# NOTE: deliberately not using `crictl` here. It is installed by the
+# kube_packages role, which runs *after* this one. Check the socket directly.
 - name: runtime | Wait for the CRI socket to appear
   ansible.builtin.stat:
     path: "{{ cri_socket | regex_replace('^unix://', '') }}"
