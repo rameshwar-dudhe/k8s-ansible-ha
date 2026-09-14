@@ -1,0 +1,37 @@
+---
+# ============================================================================
+#  Kubernetes Gateway API (https://gateway-api.sigs.k8s.io/)
+#
+#  This role installs the CRDs only. The IMPLEMENTATION is Cilium — see
+#  roles/cni/tasks/cilium.yml, which enables `gatewayAPI.enabled` whenever
+#  `gateway_api_enabled` is true.
+#
+#  Cilium's Gateway API controller only works with the kube-proxy replacement,
+#  so turning this on forces `kube_proxy_mode: none` (wired in group_vars).
+# ============================================================================
+
+gateway_api_enabled: true
+
+# kubernetes-sigs/gateway-api release tag. v1.6.1 is the version Cilium 1.20
+# validates against — keep the two aligned when bumping cilium_version.
+gateway_api_version: "v1.6.1"
+
+# standard      — GA + graduated-beta resources: GatewayClass, Gateway,
+#                 HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute,
+#                 BackendTLSPolicy, ReferenceGrant. This is what Cilium needs.
+# experimental  — the above plus alpha fields and XListenerSet. Only pick this
+#                 if a workload actually needs an experimental field.
+gateway_api_channel: "standard"
+
+# How Cilium exposes each Gateway resource:
+#   hostNetwork  — Gateway listeners bind directly on host ports on every node;
+#                  the kube-vip VIP fronts them. No LoadBalancer provider
+#                  needed. This is the sane default for this bare-metal lab.
+#                  The cni/gateway_api roles also grant cilium-envoy
+#                  NET_BIND_SERVICE so listeners on 80/443 work — without it
+#                  Envoy NACKs a privileged-port listener in a tight xDS loop
+#                  that starves the agent and stalls CNI ADD for new pods.
+#   loadbalancer — Cilium creates one Service type=LoadBalancer per Gateway.
+#                  Needs an LB provider (set kubevip_svc_enable=true), otherwise
+#                  the Service address stays <pending> forever.
+gateway_api_expose: "hostNetwork"

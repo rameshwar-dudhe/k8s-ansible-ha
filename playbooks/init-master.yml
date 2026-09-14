@@ -38,4 +38,8 @@
     # control_plane_init drives the kubevip role itself, twice: once against
     # super-admin.conf before `kubeadm init`, then against admin.conf after.
     - role: control_plane_init
+    # Gateway API CRDs go in BEFORE the CNI: Cilium's Gateway API controller
+    # crash-loops if the gateway.networking.k8s.io types do not exist yet.
+    - role: gateway_api
+      when: gateway_api_enabled | bool
     - role: cni

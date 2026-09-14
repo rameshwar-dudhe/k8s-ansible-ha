@@ -20,7 +20,9 @@ Requires **ansible-core only** — no Galaxy collections.
 | | Weave Net (community fork) | v2.9.0 — archived upstream, use for reference only |
 | Container runtime (selectable) | containerd | 2.3.3 |
 | | CRI-O | 1.36.3 |
-| kube-proxy mode | nftables (default) / iptables / ipvs / none | — |
+| kube-proxy mode | nftables / iptables / ipvs / none | `none` when Gateway API is on, else `nftables` |
+| Gateway API | CRDs + Cilium implementation | **v1.6.1** standard channel (`gateway_api_enabled`, on by default) |
+| Metrics | metrics-server (`kubectl top`, HPA) | **v0.9.0** (`metrics_server_enabled`, on by default) |
 | OS support | Ubuntu, RHEL, Rocky | auto-detected, no manual switch |
 | HA topology | 1–4 control planes + N workers | odd control-plane count enforced |
 
@@ -74,16 +76,18 @@ inventory/
 playbooks/
   guard.yml                 # safety gate 1 — imported first by everything
   preflight.yml             # read-only; changes nothing
-  create-cluster.yml        # umbrella: preflight → init → masters → workers
-  init-master.yml           # kubeadm init on master_primary + CNI
+  create-cluster.yml        # umbrella: preflight → init → masters → workers → metrics-server
+  init-master.yml           # kubeadm init on master_primary + Gateway API + CNI
   add-master.yml            # join extra control planes
   add-worker.yml            # join workers
+  deploy-gateway-api.yml    # retrofit Gateway API onto a running kube-proxy cluster
+  metrics-server.yml        # turn metrics-server on/off on a running cluster
   set-static-ip.yml         # convert nodes from a DHCP lease to a static address
   destroy-cluster.yml       # drain → reset → wipe
 roles/
   safety/  common/  container_runtime/  kube_packages/
-  kubevip/  control_plane_init/  cni/
-  join_control_plane/  join_worker/  reset/
+  kubevip/  control_plane_init/  gateway_api/  cni/
+  join_control_plane/  join_worker/  metrics_server/  reset/
 artifacts/                  # admin.conf + join commands (mode 0600), created at run time
 ```
 
@@ -151,11 +155,18 @@ All set in `inventory/group_vars/all.yml`, overridable with `-e`.
 
 | Variable | Values | Default |
 |---|---|---|
-| `k8s_minor` | `1.36` | `1.36` |
-| `k8s_patch` | `""` = newest in minor, or e.g. `1.36.1` | `""` |
+| `k8s_minor` | `1.37` | `1.37` |
+| `k8s_patch` | `""` = newest in minor, or e.g. `1.37.0` | `""` |
 | `cri` | `containerd`, `crio` | `containerd` |
 | `cni` | `calico`, `cilium`, `weavenet` | `calico` |
-| `kube_proxy_mode` | `nftables`, `iptables`, `ipvs`, `none` | `nftables` |
+| `kube_proxy_mode` | `nftables`, `iptables`, `ipvs`, `none` | derived: `none` if `gateway_api_enabled` else `nftables` |
+| `gateway_api_enabled` | `true`, `false` | `true` |
+| `gateway_api_version` | any `kubernetes-sigs/gateway-api` tag | `v1.6.1` |
+| `gateway_api_channel` | `standard`, `experimental` | `standard` |
+| `gateway_api_expose` | `hostNetwork`, `loadbalancer` | `hostNetwork` |
+| `metrics_server_enabled` | `true`, `false` | `true` |
+| `metrics_server_version` | any `kubernetes-sigs/metrics-server` tag | `v0.9.0` |
+| `metrics_server_kubelet_insecure_tls` | `true`, `false` | `true` |
 | `kubevip_enabled` | `true`, `false` | `true` |
 | `kubevip_vip` | any free IP | `192.168.56.140` |
 | `kubevip_mode` | `arp`, `bgp` | `arp` |
@@ -174,6 +185,110 @@ ansible-playbook playbooks/create-cluster.yml -e kubevip_vip=192.168.56.200
 **OS is auto-detected** from `ansible_facts.os_family` (Ubuntu → Debian family,
 RHEL/Rocky → RedHat family). There is no manual OS switch, because a manual
 setting that disagrees with the real machine is only ever a footgun.
+
+---
+
+## Gateway API
+
+`gateway_api_enabled: true` (the default) installs the Kubernetes **Gateway API**
+CRDs (`kubernetes-sigs/gateway-api` **v1.6.1**, standard channel) and wires
+**Cilium** up as the implementation.
+
+**On a from-scratch build there is nothing extra to do** — `create-cluster.yml`
+applies the CRDs (the `gateway_api` role, which runs *before* the CNI so Cilium's
+controller never starts against missing types) and Cilium comes up with
+`gatewayAPI.enabled=true`.
+
+```bash
+kubectl get gatewayclass          # -> cilium   Accepted
+kubectl apply -f examples/httpd-gateway.yaml
+curl -H 'Host: httpd.k8s-ha.lab' http://192.168.56.100/
+```
+
+**Why `kube_proxy_mode` becomes `none`.** Cilium's Gateway API controller only
+runs with the kube-proxy replacement. So `kube_proxy_mode` is *derived*:
+`none` when `gateway_api_enabled`, `nftables` otherwise. Cilium then does what
+kube-proxy did (`kubeProxyReplacement=true`, `k8sServiceHost` = the VIP). Force
+`-e kube_proxy_mode=nftables` and the `gateway_api` role hard-aborts the
+mismatch rather than building a broken cluster.
+
+**Exposure — `gateway_api_expose: hostNetwork`.** Each Gateway's listeners bind
+directly on host ports on every node, so the kube-vip VIP fronts them with no
+LoadBalancer provider. The roles also grant `cilium-envoy` `NET_BIND_SERVICE`
+so a listener on **80/443** works — without it Envoy NACKs the privileged-port
+listener in a tight xDS loop that starves the agent and stalls CNI `ADD` for
+every new pod (learned the hard way; see the note in
+`roles/gateway_api/defaults/main.yml`). Set it to `loadbalancer` only if you
+also set `kubevip_svc_enable=true`.
+
+### Retrofitting a cluster that already has kube-proxy
+
+Flipping `gateway_api_enabled` on for an *existing* kube-proxy cluster needs the
+kube-proxy → Cilium migration, which `create-cluster.yml` will **not** do
+in-place. Use the dedicated playbook:
+
+```bash
+ansible-playbook playbooks/deploy-gateway-api.yml
+```
+
+It (1) applies the CRDs, (2) `cilium upgrade`s to `kubeProxyReplacement=true` +
+`gatewayAPI.enabled=true`, (3) deletes the kube-proxy DaemonSet/ConfigMap, and
+(4) flushes the stale `kube-proxy` nftables tables (and any iptables `KUBE-`
+chains) on every node before bouncing Cilium. Steps 2–4 cause a **brief
+(seconds) dataplane blip**. Safe to re-run — an already-migrated cluster
+short-circuits.
+
+Turn the whole thing off with `-e gateway_api_enabled=false` (keeps kube-proxy;
+installs nothing Gateway-API-related).
+
+### Tradeoff: NodePort on the kube-vip VIP
+
+With kube-proxy gone, **NodePort Services answer on the node IPs but not on the
+kube-vip VIP**. kube-vip adds the VIP to the NIC with the `deprecated` flag (so
+the node never source-selects it for outbound), and Cilium's kube-proxy
+replacement skips `deprecated` addresses when it programs NodePort frontends.
+There is no clean knob to change this.
+
+This is not a real loss: the Gateway API *is* the VIP-fronted ingress path now
+(`http://<VIP>:80` → Gateway → Service). NodePort-on-the-VIP was only ever the
+workaround this repo used before it had a Gateway. NodePort on the node IPs,
+ClusterIP, and cluster DNS all keep working. Verified after migration:
+
+```
+ClusterIP / DNS / NodePort(node IP) / Gateway-via-VIP  =  ok / ok / 200 / 200
+NodePort via VIP                                        =  000  (expected)
+```
+
+---
+
+## Metrics Server
+
+`metrics_server_enabled: true` (the default) installs **metrics-server v0.9.0**,
+which serves the `metrics.k8s.io` API behind `kubectl top`, the CPU/MEM columns
+in k9s, and HorizontalPodAutoscalers. `create-cluster.yml` runs it as its last
+stage, after the workers join, and doesn't finish until `kubectl top nodes`
+returns data.
+
+It's one switch that works both ways. Flip it on a running cluster, no rebuild:
+
+```bash
+ansible-playbook playbooks/metrics-server.yml                               # install / upgrade
+ansible-playbook playbooks/metrics-server.yml -e metrics_server_enabled=false   # remove
+```
+
+With `false`, every metrics-server object (APIService first, then the
+Deployment, Service, RBAC) is deleted, and a fresh build simply skips it.
+
+The upstream `components.yaml` is applied unmodified through a kustomize patch
+(`roles/metrics_server/templates/kustomization.yaml.j2`) that adds two things:
+
+- **`--kubelet-insecure-tls`.** kubeadm's kubelets serve port 10250 with a
+  self-signed cert that has no IP SANs, so without the flag every scrape fails
+  with `x509: cannot validate certificate`. Traffic is still encrypted; only
+  the kubelet's identity goes unverified. Controlled by
+  `metrics_server_kubelet_insecure_tls`.
+- **A control-plane toleration.** This keeps it schedulable on a cluster with
+  no workers.
 
 ---
 

@@ -1,0 +1,66 @@
+---
+# ============================================================================
+#  Install the Gateway API CRDs.
+#
+#  Runs on the primary control plane only — these are cluster-wide resources.
+#  MUST run BEFORE the cni role: Cilium's Gateway API controller crash-loops
+#  if it starts against a cluster where gateway.networking.k8s.io types do not
+#  exist yet. init-master.yml orders this role ahead of `cni` for that reason.
+# ============================================================================
+
+- name: gateway-api | Set the kubectl command
+  ansible.builtin.set_fact:
+    _kubectl: "kubectl --kubeconfig /etc/kubernetes/admin.conf"
+
+- name: gateway-api | Guard | Cilium's implementation needs kube-proxy replacement
+  when: cni == 'cilium'
+  ansible.builtin.assert:
+    that:
+      - kube_proxy_mode == 'none'
+    fail_msg: >-
+      gateway_api_enabled=true with cni=cilium requires kube_proxy_mode=none —
+      Cilium's Gateway API controller only runs with the kube-proxy replacement
+      enabled. group_vars/all.yml derives kube_proxy_mode automatically; you hit
+      this because it was overridden on the CLI. Drop the override, or set
+      -e gateway_api_enabled=false.
+    quiet: true
+
+- name: gateway-api | Fetch the {{ gateway_api_channel }}-channel CRD bundle ({{ gateway_api_version }})
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ gateway_api_version }}/{{ gateway_api_channel }}-install.yaml
+    dest: /etc/kubernetes/gateway-api-{{ gateway_api_channel }}-{{ gateway_api_version }}.yaml
+    mode: "0644"
+
+# Server-side apply: consistent with how the CNI CRDs are applied, and avoids
+# the 262 kB client-side last-applied-configuration annotation limit.
+- name: gateway-api | Apply the CRDs (server-side)
+  ansible.builtin.command: >-
+    {{ _kubectl }} apply --server-side --force-conflicts
+    -f /etc/kubernetes/gateway-api-{{ gateway_api_channel }}-{{ gateway_api_version }}.yaml
+  register: _gwapi_apply
+  # kubectl SSA always prints "serverside-applied", never "unchanged", so a
+  # no-op re-run cannot be told apart from a real change. Report not-changed
+  # to keep re-runs honest instead of permanently "changed".
+  changed_when: false
+
+- name: gateway-api | Wait for the CRDs to be Established
+  ansible.builtin.command: >-
+    {{ _kubectl }} wait --for=condition=Established --timeout=120s crd/{{ item }}
+  loop:
+    - gatewayclasses.gateway.networking.k8s.io
+    - gateways.gateway.networking.k8s.io
+    - httproutes.gateway.networking.k8s.io
+    - grpcroutes.gateway.networking.k8s.io
+    - referencegrants.gateway.networking.k8s.io
+    - tlsroutes.gateway.networking.k8s.io
+    - tcproutes.gateway.networking.k8s.io
+    - backendtlspolicies.gateway.networking.k8s.io
+  changed_when: false
+
+- name: gateway-api | Report
+  ansible.builtin.debug:
+    msg: >-
+      Gateway API {{ gateway_api_version }} ({{ gateway_api_channel }} channel)
+      CRDs Established. Implementation: {{ cni }}
+      (exposed via {{ gateway_api_expose }}).

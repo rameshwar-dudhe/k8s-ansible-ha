@@ -1,0 +1,50 @@
+# ============================================================================
+#  A VS Code user-data directory was opened as this project's folder, so its
+#  profile state landed in the repo root. None of it belongs to the playbooks.
+# ============================================================================
+
+# Chromium/Electron caches and state
+Cache/
+CachedConfigurations/
+CachedData/
+CachedProfilesData/
+Code Cache/
+GPUCache/
+DawnGraphiteCache/
+DawnWebGPUCache/
+Shared Dictionary/
+Local Storage/
+Session Storage/
+SharedStorage*
+Crashpad/
+DIPS
+Dictionaries/
+Local State
+Network Persistent State
+Preferences
+TransportSecurity
+Trust Tokens
+Trust Tokens-journal
+
+# VS Code profile / workspace state
+User/
+agent-host/
+languagepacks.json
+logs/
+machineid
+.vscode/
+
+# ── Ansible ────────────────────────────────────────────────────────────────
+# Generated at run time and SECRET: admin.conf holds cluster-admin client
+# certs, join-commands.sh holds live bootstrap tokens and CA hashes.
+artifacts/
+*.retry
+*.log
+
+# ── Local tooling ──────────────────────────────────────────────────────────
+.claude/settings.local.json
+
+# ── Editor / OS noise ──────────────────────────────────────────────────────
+*.swp
+*~
+.DS_Store

@@ -11,7 +11,8 @@
 #    2. init-master   — kube-vip + kubeadm init on master_primary, then the CNI
 #    3. add-master    — extra control planes join through the VIP (no-op if none)
 #    4. add-worker    — workers join through the VIP (no-op if none)
-#    5. summary       — where things ended up
+#    5. metrics-server — install it, or remove it if metrics_server_enabled=false
+#    6. summary       — where things ended up
 #
 #  Every stage re-runs the `safety` role. 192.168.56.133 is never touched.
 # ============================================================================
@@ -29,6 +30,11 @@
 
 - name: Import — join workers
   ansible.builtin.import_playbook: add-worker.yml
+
+# After the workers: metrics-server needs the pod network, and scheduling it
+# once every node is in means its rollout wait never races a join.
+- name: Import — Metrics Server
+  ansible.builtin.import_playbook: metrics-server.yml
 
 - name: Summary
   hosts: master_primary

@@ -1,0 +1,108 @@
+---
+# ============================================================================
+#  Install or remove Metrics Server, depending on `metrics_server_enabled`.
+#
+#  Runs on the primary control plane only — these are cluster-wide resources.
+#  Needs a working pod network, so it runs AFTER the CNI (create-cluster.yml
+#  imports metrics-server.yml once the workers have joined).
+# ============================================================================
+
+- name: metrics-server | Set the kubectl command and working directory
+  ansible.builtin.set_fact:
+    _kubectl: "kubectl --kubeconfig /etc/kubernetes/admin.conf"
+    _ms_dir: /etc/kubernetes/metrics-server
+
+# ─────────────────────────────── enabled ───────────────────────────────────
+- name: metrics-server | Install
+  when: metrics_server_enabled | bool
+  block:
+    - name: metrics-server | Create the manifest directory
+      ansible.builtin.file:
+        path: "{{ _ms_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: metrics-server | Fetch the release manifest ({{ metrics_server_version }})
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/kubernetes-sigs/metrics-server/releases/download/{{ metrics_server_version }}/components.yaml
+        dest: "{{ _ms_dir }}/components-{{ metrics_server_version }}.yaml"
+        mode: "0644"
+
+    - name: metrics-server | Render the kustomization
+      ansible.builtin.template:
+        src: kustomization.yaml.j2
+        dest: "{{ _ms_dir }}/kustomization.yaml"
+        mode: "0644"
+
+    # Client-side apply prints "deployment.apps/metrics-server configured" on
+    # every run even when nothing differs, so its output can't drive changed.
+    # `kubectl diff` exits 0 = in sync, 1 = differs, >1 = error.
+    - name: metrics-server | Diff the live objects against the kustomization
+      ansible.builtin.command: "{{ _kubectl }} diff -k {{ _ms_dir }}"
+      register: _ms_diff
+      failed_when: _ms_diff.rc > 1
+      changed_when: false
+
+    - name: metrics-server | Apply
+      when: _ms_diff.rc == 1
+      ansible.builtin.command: "{{ _kubectl }} apply -k {{ _ms_dir }}"
+      changed_when: true
+
+    - name: metrics-server | Wait for the Deployment rollout
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system rollout status deployment/metrics-server --timeout=300s
+      changed_when: false
+
+    - name: metrics-server | Wait for the metrics.k8s.io APIService to be Available
+      ansible.builtin.command: >-
+        {{ _kubectl }} wait --for=condition=Available --timeout=180s
+        apiservice/v1beta1.metrics.k8s.io
+      changed_when: false
+
+    # Available only means the API answers; the first `top` needs two scrapes
+    # (--metric-resolution=15s) before it has a rate to report.
+    - name: metrics-server | Wait until `kubectl top nodes` returns data
+      ansible.builtin.command: "{{ _kubectl }} top nodes"
+      register: _ms_top
+      until: _ms_top.rc == 0
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    - name: metrics-server | Report
+      ansible.builtin.debug:
+        msg: "{{ ['Metrics Server ' ~ metrics_server_version ~ ' is serving metrics.k8s.io:'] + _ms_top.stdout_lines }}"
+
+# ─────────────────────────────── disabled ──────────────────────────────────
+- name: metrics-server | Remove
+  when: not (metrics_server_enabled | bool)
+  block:
+    # Names match the upstream components.yaml. The APIService goes first so
+    # the apiserver stops advertising metrics.k8s.io before its backend is gone
+    # (otherwise discovery briefly logs "unable to retrieve the complete list").
+    - name: metrics-server | Delete every metrics-server object
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system delete --ignore-not-found
+        apiservice/v1beta1.metrics.k8s.io
+        deployment/metrics-server
+        service/metrics-server
+        rolebinding/metrics-server-auth-reader
+        serviceaccount/metrics-server
+        clusterrolebinding/metrics-server:system:auth-delegator
+        clusterrolebinding/system:metrics-server
+        clusterrole/system:aggregated-metrics-reader
+        clusterrole/system:metrics-server
+      register: _ms_delete
+      changed_when: "'deleted' in _ms_delete.stdout"
+
+    - name: metrics-server | Remove the manifest directory
+      ansible.builtin.file:
+        path: "{{ _ms_dir }}"
+        state: absent
+
+    - name: metrics-server | Report
+      ansible.builtin.debug:
+        msg: >-
+          metrics_server_enabled=false —
+          {{ 'Metrics Server removed' if _ms_delete is changed else 'Metrics Server was not installed; nothing to do' }}.

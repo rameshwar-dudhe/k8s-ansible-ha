@@ -1,0 +1,37 @@
+---
+# ============================================================================
+#  Turn Metrics Server on or off on an EXISTING cluster.
+#
+#    ansible-playbook playbooks/metrics-server.yml                              # install / upgrade
+#    ansible-playbook playbooks/metrics-server.yml -e metrics_server_enabled=false  # remove
+#
+#  create-cluster.yml imports this after the workers join, so a from-scratch
+#  build already honours `metrics_server_enabled` — this playbook is for
+#  flipping it later without rebuilding. Safe to re-run.
+#
+#  Every stage re-runs the `safety` role. 192.168.56.133 is never touched.
+# ============================================================================
+
+- name: Import — safety guard (runs first, before any remote connection)
+  ansible.builtin.import_playbook: guard.yml
+
+- name: Metrics Server
+  hosts: master_primary
+  gather_facts: true
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+
+    - name: Refuse to run against more than one primary
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - groups['master_primary'] | length == 1
+        fail_msg: "`master_primary` must contain exactly one host."
+        quiet: true
+
+  roles:
+    - role: metrics_server

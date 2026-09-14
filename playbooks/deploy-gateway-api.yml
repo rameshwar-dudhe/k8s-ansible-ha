@@ -1,0 +1,252 @@
+---
+# ============================================================================
+#  Deploy the Kubernetes Gateway API onto an EXISTING cluster and make Cilium
+#  its implementation.
+#
+#    ansible-playbook playbooks/deploy-gateway-api.yml
+#
+#  Steps:
+#    1. install the Gateway API CRDs                        (roles/gateway_api)
+#    2. reconfigure Cilium: kubeProxyReplacement=true + gatewayAPI.enabled=true
+#    3. delete the now-redundant kube-proxy DaemonSet / ConfigMap
+#    4. flush stale kube-proxy dataplane rules on every node, then bounce Cilium
+#
+#  Steps 2-4 change the cluster's networking model and cause a brief (seconds)
+#  dataplane blip while Cilium takes over service routing. Safe to re-run — an
+#  already-migrated cluster short-circuits at each step.
+#
+#  A cluster built FROM SCRATCH with gateway_api_enabled=true already has all of
+#  this done by create-cluster.yml. This playbook is only for retrofitting a
+#  cluster that still runs kube-proxy.
+#
+#  Every stage re-runs the `safety` role. 192.168.56.133 is never touched.
+# ============================================================================
+
+- name: Import — safety guard (runs first, before any remote connection)
+  ansible.builtin.import_playbook: guard.yml
+
+# ───────────────────── 1-3. CRDs + Cilium + kube-proxy removal ──────────────
+- name: Install Gateway API and reconfigure Cilium
+  hosts: master_primary
+  gather_facts: true
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+
+    - name: Refuse to run against more than one primary
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - groups['master_primary'] | length == 1
+        fail_msg: "`master_primary` must contain exactly one host."
+        quiet: true
+
+    - name: Assert Gateway API is actually enabled
+      ansible.builtin.assert:
+        that:
+          - gateway_api_enabled | bool
+        fail_msg: >-
+          gateway_api_enabled is false. Set it true in group_vars/all.yml
+          (or pass -e gateway_api_enabled=true) before running this playbook.
+        quiet: true
+
+    - name: Assert the implementation is Cilium
+      ansible.builtin.assert:
+        that:
+          - cni == 'cilium'
+        fail_msg: >-
+          This playbook wires Cilium up as the Gateway API implementation, but
+          cni={{ cni }}. Only cilium is supported here.
+        quiet: true
+
+  tasks:
+    - name: Install the Gateway API CRDs
+      ansible.builtin.import_role:
+        name: gateway_api
+
+    - name: gw | Set the kubectl command
+      ansible.builtin.set_fact:
+        _kubectl: "kubectl --kubeconfig /etc/kubernetes/admin.conf"
+
+    - name: gw | Read Cilium's current Gateway API / kube-proxy / envoy-cap state
+      ansible.builtin.shell:
+        cmd: >-
+          {{ _kubectl }} -n kube-system get configmap cilium-config -o json
+          | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"];
+          print(d.get("enable-gateway-api","")+"|"+d.get("kube-proxy-replacement","")+"|"+d.get("envoy-keep-cap-netbindservice",""))'
+      register: _cil_now
+      changed_when: false
+
+    - name: gw | Work out what Cilium still needs
+      ansible.builtin.set_fact:
+        _need_gwapi: "{{ (_cil_now.stdout | trim).split('|')[0] != 'true' }}"
+        _need_netbind: >-
+          {{ gateway_api_expose == 'hostNetwork'
+             and (_cil_now.stdout | trim).split('|')[2] != 'true' }}
+
+    # hostNetwork mode runs Envoy in the host netns; binding a Gateway listener
+    # on a privileged port (80/443) then needs NET_BIND_SERVICE. Without it Envoy
+    # NACKs the listener in a tight xDS loop that starves the agent and stalls
+    # CNI ADD for every new pod. Grant the cap up front.
+    - name: gw | Reconfigure Cilium — kube-proxy replacement + Gateway API (+ hostNetwork caps)
+      when: _need_gwapi or _need_netbind
+      ansible.builtin.command: >-
+        cilium upgrade --version {{ cilium_version }} --reuse-values
+        --set kubeProxyReplacement=true
+        --set k8sServiceHost={{ control_plane_endpoint }}
+        --set k8sServicePort={{ control_plane_port }}
+        --set gatewayAPI.enabled=true
+        {% if gateway_api_expose == 'hostNetwork' %}
+        --set gatewayAPI.hostNetwork.enabled=true
+        --set envoy.securityContext.capabilities.keepCapNetBindService=true
+        --set envoy.securityContext.capabilities.envoy={NET_ADMIN,SYS_ADMIN,NET_BIND_SERVICE}
+        {% endif %}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: true
+
+    # Cilium's official Gateway API guide: after enabling, rollout restart the
+    # operator (it runs the Gateway API controller) and the agent DaemonSet.
+    - name: gw | Roll the Cilium operator and agent so they pick up Gateway API
+      when: _need_gwapi or _need_netbind
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system rollout restart {{ item }}
+      loop:
+        - deployment/cilium-operator
+        - daemonset/cilium
+      changed_when: true
+
+    - name: gw | Wait for Cilium to settle after the reconfigure
+      when: _need_gwapi or _need_netbind
+      ansible.builtin.command: cilium status --wait --wait-duration 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: _cil_status
+      changed_when: false
+
+    - name: gw | Roll the Envoy DaemonSet so the new capabilities take effect
+      when: _need_netbind
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system rollout restart daemonset/cilium-envoy
+      changed_when: true
+
+    - name: gw | Wait for the Envoy rollout
+      when: _need_netbind
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system rollout status daemonset/cilium-envoy --timeout=300s
+      changed_when: false
+
+    - name: gw | Delete the redundant kube-proxy DaemonSet and ConfigMap
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system delete {{ item }} --ignore-not-found
+      loop:
+        - daemonset/kube-proxy
+        - configmap/kube-proxy
+      register: _kp_del
+      changed_when: "'deleted' in (_kp_del.stdout | default(''))"
+
+# ───────────────────── 4. Flush stale kube-proxy rules per node ─────────────
+- name: Flush stale kube-proxy dataplane rules on every node
+  hosts: k8s_cluster
+  gather_facts: true
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: Enforce the host guard rails
+      ansible.builtin.import_role:
+        name: safety
+
+  tasks:
+    # This cluster runs kube-proxy in nftables mode, so its rules live in the
+    # `kube-proxy` nft tables. Deleting the table is a clean, contained removal.
+    - name: gw | Drop kube-proxy's nftables tables if present
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          removed=""
+          for t in "ip kube-proxy" "ip6 kube-proxy"; do
+            if nft list table $t >/dev/null 2>&1; then
+              nft delete table $t && removed="$removed[$t]"
+            fi
+          done
+          [ -n "$removed" ] && echo "removed:$removed" || echo "none"
+      register: _nft_kp
+      changed_when: "'removed:' in (_nft_kp.stdout | default(''))"
+      failed_when: false
+
+    # Belt and braces for a cluster that had ever run kube-proxy in iptables
+    # mode. Matches only kube-proxy's own service chains — NOT KUBE-KUBELET-CANARY
+    # or KUBE-IPTABLES-HINT, which kubelet keeps recreating (matching those would
+    # make this flush iptables on every run forever).
+    - name: gw | Drop kube-proxy's iptables chains if present
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          pat='KUBE-(SERVICES|SVC-|SEP-|EXT-|FW-|XLB-|NODEPORTS|POSTROUTING|MARK-|PROXY-|LOAD-BALANCER)'
+          if iptables-save 2>/dev/null | grep -qE "$pat"; then
+            iptables-save    | grep -vE "$pat" | iptables-restore
+            ip6tables-save 2>/dev/null | grep -vE "$pat" | ip6tables-restore 2>/dev/null || true
+            echo "flushed"
+          else
+            echo "none"
+          fi
+      register: _ipt_kp
+      changed_when: "'flushed' in (_ipt_kp.stdout | default(''))"
+      failed_when: false
+
+    - name: gw | Restart Cilium to reprogram the dataplane (only if rules were flushed)
+      when: _nft_kp is changed or _ipt_kp is changed
+      run_once: true
+      delegate_to: "{{ groups['master_primary'][0] }}"
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system
+        rollout restart daemonset/cilium
+      changed_when: true
+
+    - name: gw | Wait for the Cilium rollout
+      when: _nft_kp is changed or _ipt_kp is changed
+      run_once: true
+      delegate_to: "{{ groups['master_primary'][0] }}"
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system
+        rollout status daemonset/cilium --timeout=300s
+      changed_when: false
+
+# ─────────────────────────────── Summary ───────────────────────────────────
+- name: Summary
+  hosts: master_primary
+  gather_facts: false
+  tasks:
+    - name: gw | Collect the result
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          echo "=== Gateway API CRDs ==="
+          kubectl get crd -o name | grep gateway.networking.k8s.io | sed 's#customresourcedefinition.apiextensions.k8s.io/##'
+          echo
+          echo "=== GatewayClass ==="
+          kubectl get gatewayclass
+          echo
+          echo "=== kube-proxy (should be gone) ==="
+          kubectl -n kube-system get ds kube-proxy --ignore-not-found || true
+          echo
+          echo "=== Cilium ==="
+          cilium status | sed -n '1,12p'
+      register: _gw_summary
+      changed_when: false
+
+    - name: gw | Result
+      ansible.builtin.debug:
+        msg: "{{ _gw_summary.stdout_lines }}"
+
+    - name: gw | Next steps
+      ansible.builtin.debug:
+        msg:
+          - "Gateway API is live. Create a GatewayClass-backed Gateway with"
+          - "  gatewayClassName: cilium"
+          - "Listeners bind on host ports on every node ({{ gateway_api_expose }} mode),"
+          - "so the kube-vip VIP {{ kubevip_vip }} fronts them."
+          - "Example manifest: examples/httpd-gateway.yaml"
