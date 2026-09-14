@@ -22,6 +22,7 @@ Requires **ansible-core only** — no Galaxy collections.
 | | CRI-O | 1.36.3 |
 | kube-proxy mode | nftables / iptables / ipvs / none | `none` when Gateway API is on, else `nftables` |
 | Gateway API | CRDs + Cilium implementation | **v1.6.1** standard channel (`gateway_api_enabled`, on by default) |
+| Metrics | metrics-server (`kubectl top`, HPA) | **v0.9.0** (`metrics_server_enabled`, on by default) |
 | OS support | Ubuntu, RHEL, Rocky | auto-detected, no manual switch |
 | HA topology | 1–4 control planes + N workers | odd control-plane count enforced |
 
@@ -75,17 +76,18 @@ inventory/
 playbooks/
   guard.yml                 # safety gate 1 — imported first by everything
   preflight.yml             # read-only; changes nothing
-  create-cluster.yml        # umbrella: preflight → init → masters → workers
+  create-cluster.yml        # umbrella: preflight → init → masters → workers → metrics-server
   init-master.yml           # kubeadm init on master_primary + Gateway API + CNI
   add-master.yml            # join extra control planes
   add-worker.yml            # join workers
   deploy-gateway-api.yml    # retrofit Gateway API onto a running kube-proxy cluster
+  metrics-server.yml        # turn metrics-server on/off on a running cluster
   set-static-ip.yml         # convert nodes from a DHCP lease to a static address
   destroy-cluster.yml       # drain → reset → wipe
 roles/
   safety/  common/  container_runtime/  kube_packages/
   kubevip/  control_plane_init/  gateway_api/  cni/
-  join_control_plane/  join_worker/  reset/
+  join_control_plane/  join_worker/  metrics_server/  reset/
 artifacts/                  # admin.conf + join commands (mode 0600), created at run time
 ```
 
@@ -162,6 +164,9 @@ All set in `inventory/group_vars/all.yml`, overridable with `-e`.
 | `gateway_api_version` | any `kubernetes-sigs/gateway-api` tag | `v1.6.1` |
 | `gateway_api_channel` | `standard`, `experimental` | `standard` |
 | `gateway_api_expose` | `hostNetwork`, `loadbalancer` | `hostNetwork` |
+| `metrics_server_enabled` | `true`, `false` | `true` |
+| `metrics_server_version` | any `kubernetes-sigs/metrics-server` tag | `v0.9.0` |
+| `metrics_server_kubelet_insecure_tls` | `true`, `false` | `true` |
 | `kubevip_enabled` | `true`, `false` | `true` |
 | `kubevip_vip` | any free IP | `192.168.56.140` |
 | `kubevip_mode` | `arp`, `bgp` | `arp` |
@@ -253,6 +258,37 @@ ClusterIP, and cluster DNS all keep working. Verified after migration:
 ClusterIP / DNS / NodePort(node IP) / Gateway-via-VIP  =  ok / ok / 200 / 200
 NodePort via VIP                                        =  000  (expected)
 ```
+
+---
+
+## Metrics Server
+
+`metrics_server_enabled: true` (the default) installs **metrics-server v0.9.0**,
+which serves the `metrics.k8s.io` API behind `kubectl top`, the CPU/MEM columns
+in k9s, and HorizontalPodAutoscalers. `create-cluster.yml` runs it as its last
+stage, after the workers join, and doesn't finish until `kubectl top nodes`
+returns data.
+
+It's one switch that works both ways. Flip it on a running cluster, no rebuild:
+
+```bash
+ansible-playbook playbooks/metrics-server.yml                               # install / upgrade
+ansible-playbook playbooks/metrics-server.yml -e metrics_server_enabled=false   # remove
+```
+
+With `false`, every metrics-server object (APIService first, then the
+Deployment, Service, RBAC) is deleted, and a fresh build simply skips it.
+
+The upstream `components.yaml` is applied unmodified through a kustomize patch
+(`roles/metrics_server/templates/kustomization.yaml.j2`) that adds two things:
+
+- **`--kubelet-insecure-tls`.** kubeadm's kubelets serve port 10250 with a
+  self-signed cert that has no IP SANs, so without the flag every scrape fails
+  with `x509: cannot validate certificate`. Traffic is still encrypted; only
+  the kubelet's identity goes unverified. Controlled by
+  `metrics_server_kubelet_insecure_tls`.
+- **A control-plane toleration.** This keeps it schedulable on a cluster with
+  no workers.
 
 ---
 

@@ -1,0 +1,28 @@
+---
+# ============================================================================
+#  Metrics Server (https://github.com/kubernetes-sigs/metrics-server)
+#
+#  Serves the metrics.k8s.io API: `kubectl top`, k9s CPU/MEM columns, and the
+#  HorizontalPodAutoscaler all read from it.
+#
+#  One switch, both directions:
+#    true  -> installed (or upgraded) and verified with `kubectl top nodes`
+#    false -> every metrics-server object is removed from the cluster
+# ============================================================================
+
+metrics_server_enabled: true
+
+# kubernetes-sigs/metrics-server release tag. Compatibility (upstream README):
+#   0.9.x -> Kubernetes 1.34+     0.8.x -> 1.31+     0.7.x -> 1.27+
+metrics_server_version: "v0.9.0"
+
+# kubeadm's kubelets serve 10250 with a SELF-SIGNED certificate that has no IP
+# SANs, so metrics-server cannot verify it and every scrape fails with
+#   x509: cannot validate certificate ... because it doesn't contain any IP SANs
+# `true` adds --kubelet-insecure-tls: traffic is still TLS-encrypted, the
+# kubelet's identity just isn't verified. Fine for this lab.
+#
+# Only set `false` if the kubelets have serving certs signed by the cluster CA
+# (serverTLSBootstrap: true + approved kubelet-serving CSRs). This repo does not
+# set that up, so `false` on a stock build leaves `kubectl top` broken.
+metrics_server_kubelet_insecure_tls: true

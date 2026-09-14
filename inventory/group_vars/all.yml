@@ -131,6 +131,20 @@ gateway_api_version: "v1.6.1"       # kubernetes-sigs/gateway-api release
 gateway_api_channel: "standard"     # standard | experimental
 gateway_api_expose: "hostNetwork"   # hostNetwork | loadbalancer
 
+# ──────────────────────────── Metrics Server ───────────────────────────────
+# Serves metrics.k8s.io — what `kubectl top`, k9s CPU/MEM and HPAs read.
+#
+#   true  -> installed by create-cluster.yml once the workers have joined
+#   false -> not installed; on a running cluster, removed
+#
+# Flip it on an existing cluster without rebuilding:
+#   ansible-playbook playbooks/metrics-server.yml -e metrics_server_enabled=false
+#
+# Full knob notes (incl. why kubelet TLS isn't verified): roles/metrics_server/defaults/main.yml
+metrics_server_enabled: true
+metrics_server_version: "v0.9.0"             # 0.9.x supports Kubernetes 1.34+
+metrics_server_kubelet_insecure_tls: true    # kubeadm kubelet certs are self-signed
+
 # ───────────────────────────────  CNI  ──────────────────────────────────────
 cni: "cilium"              # calico | cilium | weavenet
 

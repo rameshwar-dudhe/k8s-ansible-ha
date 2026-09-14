@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+#
+# The upstream release manifest, unmodified, plus a small patch. Keeping the
+# changes as a kustomize patch (rather than editing the downloaded file) means a
+# version bump is just a new resources: entry — nothing to re-apply by hand.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - components-{{ metrics_server_version }}.yaml
+patches:
+  - target:
+      kind: Deployment
+      name: metrics-server
+    patch: |-
+{% if metrics_server_kubelet_insecure_tls | bool %}
+      # kubeadm kubelet serving certs are self-signed — see roles/metrics_server/defaults.
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --kubelet-insecure-tls
+{% endif %}
+      # Upstream does not tolerate the control-plane taint, so on a cluster with
+      # no workers yet the pod would sit Pending. CoreDNS tolerates it too.
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule
