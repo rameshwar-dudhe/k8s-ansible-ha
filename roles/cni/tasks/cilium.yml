@@ -174,7 +174,10 @@
     # Rolling one node at a time, and every node has to pull the new agent and
     # envoy images first — minutes each on a slow uplink. Wait per component
     # with k8s_ready_timeout rather than trusting a single fixed status wait.
-    - name: cni | cilium | Wait for the upgraded {{ item }} to roll out
+    # No {{ item }} in the name: on a fresh install this whole block is skipped,
+    # the banner is still templated, and `item` does not exist then, which
+    # prints "[WARNING]: ... 'item' is undefined". The label shows each item.
+    - name: cni | cilium | Wait for the upgraded Cilium components to roll out
       ansible.builtin.command: >-
         {{ _kubectl }} -n kube-system rollout status {{ item }}
         --timeout={{ k8s_ready_timeout }}
@@ -182,6 +185,8 @@
         - daemonset/cilium
         - daemonset/cilium-envoy
         - deployment/cilium-operator
+      loop_control:
+        label: "{{ item }}"
       changed_when: false
 
 - name: cni | cilium | Wait for Cilium to become ready

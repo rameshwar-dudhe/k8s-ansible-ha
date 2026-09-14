@@ -377,6 +377,8 @@
         - /etc/crio
         - /etc/crictl.yaml
         - /usr/local/bin/cilium
+        # Installed by roles/metrics_server (install_method: helm).
+        - /usr/local/bin/helm
         # /var/lib/containerd and /var/lib/containers are already wiped
         # unconditionally earlier in this role, regardless of this flag, and
         # stay gone because the runtime is not restarted under the purge.
