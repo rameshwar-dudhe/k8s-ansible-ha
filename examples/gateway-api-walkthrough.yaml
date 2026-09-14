@@ -1,0 +1,116 @@
+# ============================================================================
+#  Gateway API — minimal walkthrough: expose httpd through the Cilium Gateway
+# ============================================================================
+#
+#  There are FOUR objects. Read them top to bottom — each one points at the
+#  one above it:
+#
+#      Deployment  ── runs the app (httpd pods)
+#          ▲
+#      Service     ── stable ClusterIP in front of those pods
+#          ▲
+#      HTTPRoute   ── "requests for Host=hello.k8s-ha.lab go to that Service"
+#          ▲
+#      Gateway     ── the actual entrypoint: opens a listener on port 80
+#
+#  Gateway API split the old single "Ingress" object into Gateway (owned by
+#  the cluster/infra) + HTTPRoute (owned by the app team). The GatewayClass
+#  `cilium` already exists on this cluster — it is the "who implements this"
+#  pointer, like a StorageClass.
+#
+#  Apply:   kubectl apply -f examples/gateway-api-walkthrough.yaml
+#  Test :   curl -H 'Host: hello.k8s-ha.lab' http://192.168.56.100/
+#  Remove:  kubectl delete -f examples/gateway-api-walkthrough.yaml
+#
+#  (192.168.56.100 = the kube-vip VIP. gateway_api_expose is "hostNetwork",
+#   so the Gateway listener binds on port 80 of every node and the VIP
+#   fronts it — no LoadBalancer needed.)
+# ============================================================================
+
+# ── 1. The application ──────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: hello}
+  template:
+    metadata:
+      labels: {app: hello}
+    spec:
+      # This cluster keeps the control-plane taint and has one real worker;
+      # the toleration lets a replica also run on the control plane so you
+      # can see load balancing. Drop it for a real workload.
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+        - name: httpd
+          image: httpd:2.4-alpine        # serves the default "It works!" page
+          ports:
+            - {containerPort: 80}
+          resources:
+            requests: {cpu: 20m, memory: 24Mi}
+            limits: {memory: 96Mi}
+
+---
+# ── 2. The Service ──────────────────────────────────────────────────────────
+#  HTTPRoute sends traffic to a Service, never straight to pods. Plain
+#  ClusterIP is all you need — the Gateway is what faces the outside world.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: default
+spec:
+  selector: {app: hello}
+  ports:
+    - {name: http, port: 80, targetPort: 80}
+
+---
+# ── 3. The Gateway ─────────────────────────────────────────────────────────
+#  The entrypoint. "Give me an HTTP listener on port 80, implemented by the
+#  `cilium` GatewayClass." allowedRoutes controls which namespaces may attach
+#  HTTPRoutes to it — `Same` = only this namespace.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: web
+  namespace: default
+spec:
+  gatewayClassName: cilium
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+
+---
+# ── 4. The HTTPRoute ───────────────────────────────────────────────────────
+#  The routing rules. "Attach to the Gateway named `web`. For Host header
+#  hello.k8s-ha.lab, send every path (prefix /) to the `hello` Service:80."
+#
+#  Add more `rules:` for path-based routing, header matches, redirects,
+#  traffic splitting (two backendRefs with weights), etc.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hello
+  namespace: default
+spec:
+  parentRefs:
+    - name: web                 # <- the Gateway above
+  hostnames:
+    - "hello.k8s-ha.lab"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: hello           # <- the Service above
+          port: 80
