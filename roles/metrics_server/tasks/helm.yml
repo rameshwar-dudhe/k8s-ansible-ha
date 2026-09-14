@@ -1,0 +1,59 @@
+---
+# ============================================================================
+#  Install or upgrade metrics-server from the official Helm chart.
+#
+#  `helm upgrade --install` always cuts a new revision, so run it only when the
+#  deployed release differs from what is wanted (chart version, status or
+#  values). A converged re-run then reports changed=0.
+# ============================================================================
+
+- name: metrics-server | helm | Create the working directory
+  ansible.builtin.file:
+    path: "{{ _ms_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: metrics-server | helm | Render the chart values
+  ansible.builtin.template:
+    src: helm-values.yaml.j2
+    dest: "{{ _ms_dir }}/helm-values.yaml"
+    mode: "0644"
+
+- name: metrics-server | helm | Read the rendered values back
+  ansible.builtin.slurp:
+    src: "{{ _ms_dir }}/helm-values.yaml"
+  register: _ms_values_file
+
+- name: metrics-server | helm | Look up the deployed release
+  ansible.builtin.command: >-
+    {{ _helm }} list --namespace kube-system --filter '^metrics-server$' --output json
+  register: _ms_release
+  changed_when: false
+
+- name: metrics-server | helm | Read the deployed release's values
+  when: (_ms_release.stdout | from_json | length) > 0
+  ansible.builtin.command: >-
+    {{ _helm }} get values metrics-server --namespace kube-system --output json
+  register: _ms_release_values
+  changed_when: false
+
+- name: metrics-server | helm | Decide whether the release already matches
+  vars:
+    _release: "{{ (_ms_release.stdout | from_json | first) | default({}) }}"
+  ansible.builtin.set_fact:
+    _ms_helm_in_sync: >-
+      {{ (_release.status | default('')) == 'deployed'
+         and (_release.chart | default('')) == 'metrics-server-' ~ metrics_server_helm_chart_version
+         and (_ms_release_values.stdout | from_json)
+             == (_ms_values_file.content | b64decode | from_yaml) }}
+
+- name: metrics-server | helm | Install or upgrade the release (chart {{ metrics_server_helm_chart_version }})
+  when: not (_ms_helm_in_sync | bool)
+  ansible.builtin.command: >-
+    {{ _helm }} upgrade --install metrics-server metrics-server
+    --repo {{ metrics_server_helm_repo }}
+    --version {{ metrics_server_helm_chart_version }}
+    --namespace kube-system
+    --values {{ _ms_dir }}/helm-values.yaml
+    --wait --timeout {{ k8s_ready_timeout }}
+  changed_when: true

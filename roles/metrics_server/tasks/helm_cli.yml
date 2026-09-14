@@ -1,0 +1,62 @@
+---
+# ============================================================================
+#  Install the pinned helm CLI on this host (the primary control plane).
+#  Skipped when /usr/local/bin/helm already reports helm_version.
+# ============================================================================
+
+- name: metrics-server | helm-cli | Work out the archive architecture
+  ansible.builtin.set_fact:
+    _helm_arch: "{{ 'amd64' if ansible_facts.architecture == 'x86_64' else 'arm64' }}"
+
+- name: metrics-server | helm-cli | Check the installed helm version
+  ansible.builtin.command: /usr/local/bin/helm version --short
+  register: _helm_cli
+  changed_when: false
+  failed_when: false
+
+- name: metrics-server | helm-cli | Install helm {{ helm_version }}
+  # `helm version --short` prints e.g. "v3.21.3+g1ad6e68".
+  when: not (_helm_cli.stdout | default('')).startswith(helm_version ~ '+')
+  vars:
+    _helm_archive: "helm-{{ helm_version }}-linux-{{ _helm_arch }}.tar.gz"
+    _helm_workdir: "/tmp/helm-{{ helm_version }}"
+  block:
+    # The .sha256sum file is "<hash>  helm-vX.Y.Z-linux-ARCH" — its file name
+    # field omits ".tar.gz", so get_url's checksum-URL matching can't use it
+    # directly. Read the hash ourselves and pin it.
+    - name: metrics-server | helm-cli | Read the published sha256
+      ansible.builtin.uri:
+        url: "https://get.helm.sh/{{ _helm_archive }}.sha256sum"
+        return_content: true
+      register: _helm_sha256
+
+    - name: metrics-server | helm-cli | Create a scratch directory
+      ansible.builtin.file:
+        path: "{{ _helm_workdir }}"
+        state: directory
+        mode: "0755"
+
+    - name: metrics-server | helm-cli | Download the archive (checksum verified)
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/{{ _helm_archive }}"
+        dest: "{{ _helm_workdir }}/{{ _helm_archive }}"
+        checksum: "sha256:{{ _helm_sha256.content.split()[0] }}"
+        mode: "0644"
+
+    - name: metrics-server | helm-cli | Unpack the archive
+      ansible.builtin.unarchive:
+        src: "{{ _helm_workdir }}/{{ _helm_archive }}"
+        dest: "{{ _helm_workdir }}"
+        remote_src: true
+
+    - name: metrics-server | helm-cli | Install the binary to /usr/local/bin
+      ansible.builtin.copy:
+        src: "{{ _helm_workdir }}/linux-{{ _helm_arch }}/helm"
+        dest: /usr/local/bin/helm
+        remote_src: true
+        mode: "0755"
+
+    - name: metrics-server | helm-cli | Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ _helm_workdir }}"
+        state: absent

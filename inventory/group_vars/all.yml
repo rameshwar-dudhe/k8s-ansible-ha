@@ -142,7 +142,11 @@ gateway_api_expose: "hostNetwork"   # hostNetwork | loadbalancer
 #
 # Full knob notes (incl. why kubelet TLS isn't verified): roles/metrics_server/defaults/main.yml
 metrics_server_enabled: true
-metrics_server_version: "v0.9.0"             # 0.9.x supports Kubernetes 1.34+
+metrics_server_install_method: "helm"        # helm | manifest (switching is safe)
+metrics_server_version: "v0.9.0"             # image tag; 0.9.x supports Kubernetes 1.34+
+metrics_server_helm_chart_version: "3.14.0"  # chart appVersion 0.9.0
+metrics_server_replicas: 2                   # helm only; >1 adds PDB + anti-affinity
+helm_version: "v3.21.3"                      # helm CLI installed on the primary control plane
 metrics_server_kubelet_insecure_tls: true    # kubeadm kubelet certs are self-signed
 
 # ──────────────────────────── Wait timeouts ────────────────────────────────

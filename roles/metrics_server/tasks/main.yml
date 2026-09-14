@@ -1,54 +1,109 @@
 ---
 # ============================================================================
-#  Install or remove Metrics Server, depending on `metrics_server_enabled`.
+#  Install or remove Metrics Server, depending on `metrics_server_enabled`,
+#  using `metrics_server_install_method` (helm | manifest).
 #
 #  Runs on the primary control plane only — these are cluster-wide resources.
 #  Needs a working pod network, so it runs AFTER the CNI (create-cluster.yml
 #  imports metrics-server.yml once the workers have joined).
+#
+#  Flow:
+#    1. detect what is installed now (Helm release, manifest objects, or nothing)
+#    2. remove whatever does not match the wanted state (the other method, or
+#       everything when disabled) — both methods use the same object names
+#    3. install with the wanted method
+#    4. verify: rollout, APIService Available, `kubectl top nodes` returns data
 # ============================================================================
 
-- name: metrics-server | Set the kubectl command and working directory
+- name: metrics-server | Set the kubectl/helm commands and working directory
   ansible.builtin.set_fact:
     _kubectl: "kubectl --kubeconfig /etc/kubernetes/admin.conf"
+    _helm: "/usr/local/bin/helm --kubeconfig /etc/kubernetes/admin.conf"
     _ms_dir: /etc/kubernetes/metrics-server
 
-# ─────────────────────────────── enabled ───────────────────────────────────
-- name: metrics-server | Install
-  when: metrics_server_enabled | bool
+- name: metrics-server | Validate the settings
+  ansible.builtin.assert:
+    that:
+      - metrics_server_install_method in ['helm', 'manifest']
+      - (metrics_server_replicas | int) >= 1
+      - metrics_server_install_method == 'helm' or (metrics_server_replicas | int) == 1
+    fail_msg: >-
+      metrics_server_install_method must be helm or manifest (got
+      {{ metrics_server_install_method }}), and metrics_server_replicas > 1 needs
+      the helm method — the manifest method is upstream components.yaml, which
+      runs a single replica (got replicas={{ metrics_server_replicas }}).
+    quiet: true
+
+# ───────────────────────────── 1. detect ───────────────────────────────────
+# Helm stores each release revision as a Secret labelled owner=helm; reading
+# those needs no helm binary.
+- name: metrics-server | Detect an existing Helm release
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system get secret -l owner=helm,name=metrics-server -o name
+  register: _ms_helm_secrets
+  changed_when: false
+
+- name: metrics-server | Detect an existing Deployment and who manages it
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system get deployment metrics-server
+    -o 'jsonpath={.metadata.labels.app\.kubernetes\.io/managed-by}'
+  register: _ms_deploy
+  changed_when: false
+  failed_when: false
+
+- name: metrics-server | Work out what is installed now
+  ansible.builtin.set_fact:
+    _ms_has_helm: "{{ _ms_helm_secrets.stdout | trim | length > 0 }}"
+    _ms_has_manifest: "{{ _ms_deploy.rc == 0 and (_ms_deploy.stdout | trim) != 'Helm' }}"
+
+# ───────────────────────────── 2. remove ───────────────────────────────────
+- name: metrics-server | Uninstall the Helm release
+  when:
+    - _ms_has_helm | bool
+    - not (metrics_server_enabled | bool) or metrics_server_install_method != 'helm'
   block:
-    - name: metrics-server | Create the manifest directory
-      ansible.builtin.file:
-        path: "{{ _ms_dir }}"
-        state: directory
-        mode: "0755"
+    - name: metrics-server | Make sure the helm CLI is available
+      ansible.builtin.include_tasks: helm_cli.yml
 
-    - name: metrics-server | Fetch the release manifest ({{ metrics_server_version }})
-      ansible.builtin.get_url:
-        url: >-
-          https://github.com/kubernetes-sigs/metrics-server/releases/download/{{ metrics_server_version }}/components.yaml
-        dest: "{{ _ms_dir }}/components-{{ metrics_server_version }}.yaml"
-        mode: "0644"
-
-    - name: metrics-server | Render the kustomization
-      ansible.builtin.template:
-        src: kustomization.yaml.j2
-        dest: "{{ _ms_dir }}/kustomization.yaml"
-        mode: "0644"
-
-    # Client-side apply prints "deployment.apps/metrics-server configured" on
-    # every run even when nothing differs, so its output can't drive changed.
-    # `kubectl diff` exits 0 = in sync, 1 = differs, >1 = error.
-    - name: metrics-server | Diff the live objects against the kustomization
-      ansible.builtin.command: "{{ _kubectl }} diff -k {{ _ms_dir }}"
-      register: _ms_diff
-      failed_when: _ms_diff.rc > 1
-      changed_when: false
-
-    - name: metrics-server | Apply
-      when: _ms_diff.rc == 1
-      ansible.builtin.command: "{{ _kubectl }} apply -k {{ _ms_dir }}"
+    - name: metrics-server | helm uninstall metrics-server
+      ansible.builtin.command: >-
+        {{ _helm }} uninstall metrics-server --namespace kube-system --wait
+        --timeout {{ k8s_ready_timeout }}
       changed_when: true
 
+- name: metrics-server | Remove the manifest install
+  when:
+    - _ms_has_manifest | bool
+    - not (metrics_server_enabled | bool) or metrics_server_install_method != 'manifest'
+  ansible.builtin.include_tasks: remove_manifest.yml
+
+# ───────────────────────────── 3. install ──────────────────────────────────
+- name: metrics-server | Install with Helm
+  when:
+    - metrics_server_enabled | bool
+    - metrics_server_install_method == 'helm'
+  block:
+    - name: metrics-server | Install the helm CLI
+      ansible.builtin.include_tasks: helm_cli.yml
+
+    - name: metrics-server | Install the Helm release
+      ansible.builtin.include_tasks: helm.yml
+
+- name: metrics-server | Install from the manifest
+  when:
+    - metrics_server_enabled | bool
+    - metrics_server_install_method == 'manifest'
+  ansible.builtin.include_tasks: manifest.yml
+
+# ───────────────────────────── 4. verify ───────────────────────────────────
+- name: metrics-server | Verify
+  when: metrics_server_enabled | bool
+  vars:
+    _ms_pod_selector: >-
+      {{ 'app.kubernetes.io/name=metrics-server'
+         if metrics_server_install_method == 'helm'
+         else 'k8s-app=metrics-server' }}
+  block:
     - name: metrics-server | Wait for the Deployment rollout
       ansible.builtin.command: >-
         {{ _kubectl }} -n kube-system rollout status deployment/metrics-server
@@ -71,33 +126,26 @@
       delay: 10
       changed_when: false
 
+    - name: metrics-server | Show where the pods run
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system get pods -l {{ _ms_pod_selector }}
+        -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,READY:.status.containerStatuses[0].ready
+      register: _ms_pods
+      changed_when: false
+
     - name: metrics-server | Report
       ansible.builtin.debug:
-        msg: "{{ ['Metrics Server ' ~ metrics_server_version ~ ' is serving metrics.k8s.io:'] + _ms_top.stdout_lines }}"
+        msg: >-
+          {{ ['Metrics Server ' ~ metrics_server_version ~ ' via ' ~ metrics_server_install_method
+              ~ (' (chart ' ~ metrics_server_helm_chart_version ~ ')' if metrics_server_install_method == 'helm' else '')
+              ~ ' is serving metrics.k8s.io:']
+             + _ms_top.stdout_lines + [''] + _ms_pods.stdout_lines }}
 
-# ─────────────────────────────── disabled ──────────────────────────────────
-- name: metrics-server | Remove
+# ───────────────────────────── disabled ────────────────────────────────────
+- name: metrics-server | Clean up when disabled
   when: not (metrics_server_enabled | bool)
   block:
-    # Names match the upstream components.yaml. The APIService goes first so
-    # the apiserver stops advertising metrics.k8s.io before its backend is gone
-    # (otherwise discovery briefly logs "unable to retrieve the complete list").
-    - name: metrics-server | Delete every metrics-server object
-      ansible.builtin.command: >-
-        {{ _kubectl }} -n kube-system delete --ignore-not-found
-        apiservice/v1beta1.metrics.k8s.io
-        deployment/metrics-server
-        service/metrics-server
-        rolebinding/metrics-server-auth-reader
-        serviceaccount/metrics-server
-        clusterrolebinding/metrics-server:system:auth-delegator
-        clusterrolebinding/system:metrics-server
-        clusterrole/system:aggregated-metrics-reader
-        clusterrole/system:metrics-server
-      register: _ms_delete
-      changed_when: "'deleted' in _ms_delete.stdout"
-
-    - name: metrics-server | Remove the manifest directory
+    - name: metrics-server | Remove the working directory
       ansible.builtin.file:
         path: "{{ _ms_dir }}"
         state: absent
@@ -106,4 +154,6 @@
       ansible.builtin.debug:
         msg: >-
           metrics_server_enabled=false —
-          {{ 'Metrics Server removed' if _ms_delete is changed else 'Metrics Server was not installed; nothing to do' }}.
+          {{ 'Metrics Server removed'
+             if (_ms_has_helm | bool) or (_ms_has_manifest | bool)
+             else 'Metrics Server was not installed; nothing to do' }}.

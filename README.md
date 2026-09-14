@@ -22,7 +22,7 @@ Requires **ansible-core only** — no Galaxy collections.
 | | CRI-O | 1.36.3 |
 | kube-proxy mode | nftables / iptables / ipvs / none | `none` when Gateway API is on, else `nftables` |
 | Gateway API | CRDs + Cilium implementation | **v1.6.1** standard channel (`gateway_api_enabled`, on by default) |
-| Metrics | metrics-server (`kubectl top`, HPA) | **v0.9.0** (`metrics_server_enabled`, on by default) |
+| Metrics | metrics-server (`kubectl top`, HPA) | **v0.9.0** via Helm chart **3.14.0**, 2 replicas + PDB (`metrics_server_enabled`, on by default) |
 | OS support | Ubuntu, RHEL, Rocky | auto-detected, no manual switch |
 | HA topology | 1–4 control planes + N workers | odd control-plane count enforced |
 
@@ -264,7 +264,11 @@ All set in `inventory/group_vars/all.yml`, overridable with `-e`.
 | `gateway_api_channel` | `standard`, `experimental` | `standard` |
 | `gateway_api_expose` | `hostNetwork`, `loadbalancer` | `hostNetwork` |
 | `metrics_server_enabled` | `true`, `false` | `true` |
+| `metrics_server_install_method` | `helm`, `manifest` | `helm` |
 | `metrics_server_version` | any `kubernetes-sigs/metrics-server` tag | `v0.9.0` |
+| `metrics_server_helm_chart_version` | any `metrics-server` chart version | `3.14.0` |
+| `metrics_server_replicas` | `1` or more (`helm` only) | `2` |
+| `helm_version` | any helm release tag | `v3.21.3` |
 | `metrics_server_kubelet_insecure_tls` | `true`, `false` | `true` |
 | `k8s_ready_timeout` | any kubectl duration, e.g. `600s`, `20m` | `900s`; caps node-Ready-after-join and metrics-server rollout waits (slow image pulls) |
 | `kubevip_enabled` | `true`, `false` | `true` |
@@ -376,11 +380,40 @@ ansible-playbook playbooks/metrics-server.yml                               # in
 ansible-playbook playbooks/metrics-server.yml -e metrics_server_enabled=false   # remove
 ```
 
-With `false`, every metrics-server object (APIService first, then the
-Deployment, Service, RBAC) is deleted, and a fresh build simply skips it.
+With `false`, metrics-server is removed (the Helm release is uninstalled, or the
+manifest objects are deleted), and a fresh build simply skips it.
 
-The upstream `components.yaml` is applied unmodified through a kustomize patch
-(`roles/metrics_server/templates/kustomization.yaml.j2`) that adds two things:
+**Install method: `metrics_server_install_method`.**
+
+| Method | How | Replicas |
+|---|---|---|
+| `helm` (default) | Official chart `metrics-server` **3.14.0** from `kubernetes-sigs.github.io/metrics-server`. The role installs a pinned, checksum-verified `helm` **v3.21.3** on the primary control plane and runs it there, so it works under both `ansible-playbook` and `ansible-navigator`. | `metrics_server_replicas`, default **2** |
+| `manifest` | Upstream `components.yaml` plus a kustomize patch (`roles/metrics_server/templates/kustomization.yaml.j2`) | 1 only |
+
+With more than one replica, the Helm values also add:
+
+- **A PodDisruptionBudget** (`minAvailable: 1`), so `kubectl top` keeps working
+  through a node drain.
+- **A preferred pod anti-affinity on hostname**, so the pods spread across nodes.
+  The control plane counts as a node here, thanks to the toleration below. It's
+  "preferred" rather than "required", so a single-node cluster still runs every
+  replica instead of leaving one Pending.
+
+The role runs `helm upgrade` only when the deployed chart version or values
+differ from what's configured, so a converged re-run reports `changed=0`.
+
+Switching method on a running cluster is safe:
+
+```bash
+ansible-playbook playbooks/metrics-server.yml -e metrics_server_install_method=manifest -e metrics_server_replicas=1
+ansible-playbook playbooks/metrics-server.yml     # back to helm (the default)
+```
+
+Both methods create objects with the same names, and the Deployment selectors
+differ, which can't be patched in place. So the role removes the other method's
+install before it installs the new one.
+
+Both methods add the same two things on top of upstream:
 
 - **`--kubelet-insecure-tls`.** kubeadm's kubelets serve port 10250 with a
   self-signed cert that has no IP SANs, so without the flag every scrape fails

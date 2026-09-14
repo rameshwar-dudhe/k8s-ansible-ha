@@ -1,0 +1,24 @@
+---
+# ============================================================================
+#  Delete a manifest-method install (objects from upstream components.yaml).
+#  Only called when the live Deployment is NOT Helm-managed, so this never
+#  deletes objects that belong to a Helm release with the same names.
+# ============================================================================
+
+# The APIService goes first so the apiserver stops advertising metrics.k8s.io
+# before its backend is gone (otherwise discovery briefly logs "unable to
+# retrieve the complete list").
+- name: metrics-server | manifest | Delete every manifest-installed object
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system delete --ignore-not-found --wait=true
+    apiservice/v1beta1.metrics.k8s.io
+    deployment/metrics-server
+    service/metrics-server
+    rolebinding/metrics-server-auth-reader
+    serviceaccount/metrics-server
+    clusterrolebinding/metrics-server:system:auth-delegator
+    clusterrolebinding/system:metrics-server
+    clusterrole/system:aggregated-metrics-reader
+    clusterrole/system:metrics-server
+  register: _ms_manifest_delete
+  changed_when: "'deleted' in _ms_manifest_delete.stdout"

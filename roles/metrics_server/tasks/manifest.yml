@@ -1,0 +1,38 @@
+---
+# ============================================================================
+#  Install metrics-server from the upstream components.yaml + kustomize patch.
+#  Single replica.
+# ============================================================================
+
+- name: metrics-server | manifest | Create the manifest directory
+  ansible.builtin.file:
+    path: "{{ _ms_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: metrics-server | manifest | Fetch the release manifest ({{ metrics_server_version }})
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/kubernetes-sigs/metrics-server/releases/download/{{ metrics_server_version }}/components.yaml
+    dest: "{{ _ms_dir }}/components-{{ metrics_server_version }}.yaml"
+    mode: "0644"
+
+- name: metrics-server | manifest | Render the kustomization
+  ansible.builtin.template:
+    src: kustomization.yaml.j2
+    dest: "{{ _ms_dir }}/kustomization.yaml"
+    mode: "0644"
+
+# Client-side apply prints "deployment.apps/metrics-server configured" on
+# every run even when nothing differs, so its output can't drive changed.
+# `kubectl diff` exits 0 = in sync, 1 = differs, >1 = error.
+- name: metrics-server | manifest | Diff the live objects against the kustomization
+  ansible.builtin.command: "{{ _kubectl }} diff -k {{ _ms_dir }}"
+  register: _ms_diff
+  failed_when: _ms_diff.rc > 1
+  changed_when: false
+
+- name: metrics-server | manifest | Apply
+  when: _ms_diff.rc == 1
+  ansible.builtin.command: "{{ _kubectl }} apply -k {{ _ms_dir }}"
+  changed_when: true

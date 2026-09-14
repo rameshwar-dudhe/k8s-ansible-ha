@@ -7,14 +7,43 @@
 #
 #  One switch, both directions:
 #    true  -> installed (or upgraded) and verified with `kubectl top nodes`
-#    false -> every metrics-server object is removed from the cluster
+#    false -> removed from the cluster (Helm release or manifest objects)
 # ============================================================================
 
 metrics_server_enabled: true
 
-# kubernetes-sigs/metrics-server release tag. Compatibility (upstream README):
+# How it is installed:
+#   helm     — the official chart from kubernetes-sigs, run with a pinned helm
+#              binary that this role installs on the primary control plane.
+#              Supports more than one replica (see metrics_server_replicas).
+#   manifest — upstream components.yaml plus a kustomize patch. One replica.
+#
+# Switching on a running cluster is safe: both methods create objects with the
+# same names (and the Deployment selector differs, which cannot be patched), so
+# the role removes the other method's install before installing this one.
+metrics_server_install_method: "helm"
+
+# metrics-server image tag, used by both methods. Compatibility (upstream README):
 #   0.9.x -> Kubernetes 1.34+     0.8.x -> 1.31+     0.7.x -> 1.27+
 metrics_server_version: "v0.9.0"
+
+# Helm chart. 3.14.0 ships appVersion 0.9.0; the image tag above is still passed
+# explicitly so the chart and image are pinned together.
+metrics_server_helm_chart_version: "3.14.0"
+metrics_server_helm_repo: "https://kubernetes-sigs.github.io/metrics-server/"
+
+# helm CLI installed to /usr/local/bin on the primary control plane, checksum
+# verified against get.helm.sh. Pinned to v3 on purpose: helm v4 changed CLI
+# defaults, so move to it deliberately rather than by accident.
+helm_version: "v3.21.3"
+
+# Number of metrics-server pods (helm method only; manifest is always 1).
+# With more than 1, the Helm values also add a PodDisruptionBudget
+# (minAvailable: 1) and a PREFERRED pod anti-affinity on hostname: replicas
+# spread across nodes whenever enough are schedulable (the control plane counts,
+# thanks to the toleration), but a single-node cluster still runs them all
+# instead of leaving one Pending forever.
+metrics_server_replicas: 2
 
 # kubeadm's kubelets serve 10250 with a SELF-SIGNED certificate that has no IP
 # SANs, so metrics-server cannot verify it and every scrape fails with

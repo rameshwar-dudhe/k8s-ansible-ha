@@ -1,0 +1,51 @@
+# {{ ansible_managed }}
+#
+# Values for the kubernetes-sigs metrics-server chart {{ metrics_server_helm_chart_version }}.
+# The role compares this file with `helm get values` and only upgrades the
+# release when they differ, so keep every key explicit (no conditional omission).
+replicas: {{ metrics_server_replicas | int }}
+
+image:
+  tag: {{ metrics_server_version }}
+
+# Appended after the chart's defaultArgs.
+{% if metrics_server_kubelet_insecure_tls | bool %}
+args:
+  # kubeadm kubelet serving certs are self-signed — see roles/metrics_server/defaults.
+  - --kubelet-insecure-tls
+{% else %}
+args: []
+{% endif %}
+
+# Upstream does not tolerate the control-plane taint. Without this, a cluster
+# with no workers leaves the pod Pending, and with 2 replicas both would crowd
+# onto the workers instead of spreading across every node.
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+{% if (metrics_server_replicas | int) > 1 %}
+# Keep kubectl top serving through a node drain.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Preferred, not required: spread replicas across nodes when possible, but still
+# schedule them all on a single-node cluster.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: metrics-server
+              app.kubernetes.io/instance: metrics-server
+{% else %}
+podDisruptionBudget:
+  enabled: false
+
+affinity: {}
+{% endif %}
