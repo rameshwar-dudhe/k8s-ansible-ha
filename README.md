@@ -16,7 +16,7 @@ Requires **ansible-core only** — no Galaxy collections.
 | Kubernetes | kubeadm-built HA cluster | **v1.37** (`k8s_minor`, patch pinnable) |
 | Load balancer (control-plane VIP) | **kube-vip** | **v1.2.3**, ARP or BGP mode |
 | CNI (selectable) | Calico | **v3.32.1** (tigera-operator) |
-| | Cilium | **1.20.0** (CLI v0.19.7) |
+| | Cilium | **1.20.1** (CLI v0.20.0) |
 | | Weave Net (community fork) | v2.9.0 — archived upstream, use for reference only |
 | Container runtime (selectable) | containerd | 2.3.3 |
 | | CRI-O | 1.36.3 |
@@ -604,6 +604,42 @@ anything: `nft list table ip kube-proxy | grep -A2 'chain service-.*<svc>'` —
 the `numgen random mod N` tells you how many backends are actually live.
 
 ## Notes on the tricky parts
+
+**Cilium 1.20.0 xDS livelock: why the pin is 1.20.1.** On 1.20.0, cilium-agent
+and cilium-envoy can get stuck in an endless request/response loop over the
+`cilium.NetworkPolicy` xDS resource. It starts after some pod churn, not at
+install time, and there don't need to be any policies at all. This cluster hit
+it on 2026-09-14, while metrics-server pods were being replaced. Symptoms, on
+every node:
+
+- cilium-agent sits at 70–80% CPU and cilium-envoy at ~40%.
+- The agent logs thousands of `OnStreamRequest`/`OnStreamResponse` lines for
+  `xdsTypeURL=type.googleapis.com/cilium.NetworkPolicy`.
+- Envoy logs `Ignoring unwatched type URL` every few milliseconds.
+- Container logs rotate every 10–20 seconds.
+- `cilium-dbg status` still reports OK.
+
+Upstream this is [cilium/cilium#47624](https://github.com/cilium/cilium/issues/47624),
+fixed in **1.20.1** by a cilium-envoy image bump (cilium/cilium#47899).
+
+- **Workaround on 1.20.0:** run `kubectl -n kube-system rollout restart daemonset/cilium-envoy`.
+  Verified here: the agent drops from ~75% to ~3% CPU within a minute, and the
+  agent itself doesn't need a restart.
+- **Fix:** keep `cilium_version` at 1.20.1 or later. Changing it on a running
+  cluster upgrades Cilium in place. The `cni` role compares both the `cilium`
+  DaemonSet's `helm.sh/chart` label and its agent image tag against
+  `cilium_version`. On a mismatch it runs
+  `cilium upgrade --reset-then-reuse-values`, then waits for each rollout,
+  bounded by `k8s_ready_timeout`.
+- **Don't use `--reuse-values` for version upgrades.** It reuses the previous
+  release's computed values, including the old chart's default image tags. The
+  chart moves to the new version, but the pods keep running the old images.
+  That happened here on the first upgrade attempt: the chart label said
+  `cilium-1.20.1` while the agent was still on `v1.20.0`. A dry run confirmed
+  it. With `--reuse-values` the images were `cilium:v1.20.0`, envoy
+  `…1782911245` and `operator-generic:v1.20.0`. With
+  `--reset-then-reuse-values` they were `cilium:v1.20.1`, envoy `…1786810558`
+  and `operator-generic:v1.20.1`.
 
 **kube-vip and the `super-admin.conf` dance.** The VIP is the
 `controlPlaneEndpoint`, so it must answer on `:6443` *before* `kubeadm init`

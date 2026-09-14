@@ -176,10 +176,17 @@ node_network_prefix: 24
 calico_autodetect_cidrs:
   - "{{ (node_ip ~ '/' ~ node_network_prefix) | ansible.utils.ipaddr('network/prefix') }}"
 
-cilium_version: "1.20.0"
+# 1.20.1, not 1.20.0: on 1.20.0 cilium-agent and cilium-envoy can fall into an
+# endless cilium.NetworkPolicy xDS loop after pod churn (~1 CPU core per node,
+# envoy logging "Ignoring unwatched type URL" nonstop). Hit on this cluster
+# 2026-09-14; fixed upstream in 1.20.1 (cilium/cilium#47624). Bumping this on a
+# running cluster upgrades it: the cni role runs
+# `cilium upgrade --reset-then-reuse-values` (NOT --reuse-values, which keeps the
+# old chart's default image tags, so the pods would stay on the old version).
+cilium_version: "1.20.1"
 # Keep the CLI at or ahead of the Cilium release it installs — an older CLI may
-# not recognise a newer chart version.
-cilium_cli_version: "v0.19.7"
+# not recognise a newer chart version. v0.20.0 is the first CLI built for 1.20.1.
+cilium_cli_version: "v0.20.0"
 
 # Weaveworks archived the original project. This is the community fork.
 weavenet_version: "v2.9.0"

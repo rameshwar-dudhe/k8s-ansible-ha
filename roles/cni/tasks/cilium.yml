@@ -8,13 +8,19 @@
   ansible.builtin.set_fact:
     _cilium_arch: "{{ 'amd64' if ansible_facts.architecture == 'x86_64' else 'arm64' }}"
 
-- name: cni | cilium | Check whether the CLI is already present
-  ansible.builtin.stat:
-    path: /usr/local/bin/cilium
+# Compare the version, not just the file: an older CLI left on the node may not
+# know a newer chart (the pin is bumped alongside cilium_version).
+# `cilium version --client` prints e.g. "cilium-cli: v0.19.7 compiled with ...".
+- name: cni | cilium | Check the installed CLI version
+  ansible.builtin.command: /usr/local/bin/cilium version --client
   register: _cilium_cli
+  changed_when: false
+  failed_when: false
 
-- name: cni | cilium | Download the cilium CLI
-  when: not _cilium_cli.stat.exists
+- name: cni | cilium | Download the cilium CLI ({{ cilium_cli_version }})
+  when: >-
+    _cilium_cli.rc != 0
+    or ('cilium-cli: ' ~ cilium_cli_version ~ ' ') not in _cilium_cli.stdout
   ansible.builtin.unarchive:
     src: >-
       https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ _cilium_arch }}.tar.gz
@@ -82,7 +88,7 @@
     - gateway_api_enabled | default(false) | bool
     - (_cilium_gwapi.stdout | default('')) != 'true'
   ansible.builtin.command: >-
-    cilium upgrade --version {{ cilium_version }} --reuse-values
+    cilium upgrade --version {{ cilium_version }} --reset-then-reuse-values
     --set gatewayAPI.enabled=true
     {% if gateway_api_expose == 'hostNetwork' %}
     --set gatewayAPI.hostNetwork.enabled=true
@@ -117,6 +123,66 @@
       kube-proxy DaemonSet is still running alongside Cilium's kube-proxy
       replacement. Run playbooks/deploy-gateway-api.yml to remove it and flush
       its stale dataplane rules — do NOT leave both programming the dataplane.
+
+# Upgrade path: Cilium is installed at a different version than cilium_version.
+# Runs after the Gateway API step, which may already have upgraded the chart in
+# this same run.
+#
+# Check BOTH the chart label (helm.sh/chart=cilium-X.Y.Z) and the agent image
+# tag. They can disagree: `cilium upgrade --reuse-values` reuses the previous
+# release's computed values, including the OLD chart's default image tags, so
+# the chart moves to X.Y.Z while the pods keep running the old images. That is
+# why the upgrade uses --reset-then-reuse-values (new chart defaults, then this
+# cluster's own settings on top), and why a label-only check is not trusted.
+#
+# Motivating case: 1.20.0 -> 1.20.1. cilium-agent and cilium-envoy on 1.20.0 can
+# fall into an endless cilium.NetworkPolicy xDS request/response loop after pod
+# churn (~1 CPU core per node, envoy logging "Ignoring unwatched type URL"
+# nonstop). Fixed in 1.20.1; see cilium/cilium#47624.
+- name: cni | cilium | Read the installed Cilium chart version and agent image
+  when: _cilium_present.rc == 0
+  ansible.builtin.command: >-
+    {{ _kubectl }} -n kube-system get daemonset cilium
+    -o 'jsonpath={.metadata.labels.helm\.sh/chart} {.spec.template.spec.containers[0].image}'
+  register: _cilium_chart
+  changed_when: false
+
+- name: cni | cilium | Work out whether Cilium needs an upgrade
+  when: _cilium_present.rc == 0
+  vars:
+    _parts: "{{ (_cilium_chart.stdout | default('') | trim).split(' ') }}"
+  ansible.builtin.set_fact:
+    _cilium_installed_chart: "{{ _parts[0] | default('') }}"
+    # "quay.io/cilium/cilium:v1.20.0@sha256:..." -> "v1.20.0"
+    _cilium_installed_tag: "{{ ((_parts[1] | default('')).split('@')[0]).split(':')[-1] }}"
+
+- name: cni | cilium | Upgrade Cilium to the pinned version
+  when:
+    - _cilium_present.rc == 0
+    - _cilium_installed_chart != 'cilium-' ~ cilium_version
+      or _cilium_installed_tag != 'v' ~ cilium_version
+  block:
+    - name: >-
+        cni | cilium | Upgrade {{ _cilium_installed_chart | default('') }}
+        (image {{ _cilium_installed_tag | default('') }}) -> cilium-{{ cilium_version }}
+      ansible.builtin.command: >-
+        cilium upgrade --version {{ cilium_version }} --reset-then-reuse-values
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: true
+
+    # Rolling one node at a time, and every node has to pull the new agent and
+    # envoy images first — minutes each on a slow uplink. Wait per component
+    # with k8s_ready_timeout rather than trusting a single fixed status wait.
+    - name: cni | cilium | Wait for the upgraded {{ item }} to roll out
+      ansible.builtin.command: >-
+        {{ _kubectl }} -n kube-system rollout status {{ item }}
+        --timeout={{ k8s_ready_timeout }}
+      loop:
+        - daemonset/cilium
+        - daemonset/cilium-envoy
+        - deployment/cilium-operator
+      changed_when: false
 
 - name: cni | cilium | Wait for Cilium to become ready
   ansible.builtin.command: cilium status --wait --wait-duration 10m
