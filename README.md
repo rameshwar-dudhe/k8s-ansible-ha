@@ -495,6 +495,7 @@ planes → primary, because draining is impossible once the API server is gone.
 | Calico v3.32.1 | containerd 2.3.3 | nftables | built, reboot-tested, workload-tested |
 | Cilium 1.20.0 | CRI-O 1.36.3 | nftables | built, workload-tested |
 | Cilium 1.20.0 | containerd 2.3.3 | nftables | built, workload-tested |
+| Cilium 1.20.1 | CRI-O 1.36.5 | none (kube-proxy replacement) | 2026-09-14: upgraded in place from 1.20.0 with the `cni` role. Gateway API returns 200 for the right Host and 404 for others; metrics-server via Helm runs 2/2 across both nodes; the xDS livelock did not recur; re-running `init-master.yml` changes nothing |
 
 Switching runtime stops and disables the one no longer in use, so only a single
 CRI daemon ever runs — unless Docker is active, in which case containerd is left
