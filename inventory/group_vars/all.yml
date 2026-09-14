@@ -145,6 +145,15 @@ metrics_server_enabled: true
 metrics_server_version: "v0.9.0"             # 0.9.x supports Kubernetes 1.34+
 metrics_server_kubelet_insecure_tls: true    # kubeadm kubelet certs are self-signed
 
+# ──────────────────────────── Wait timeouts ────────────────────────────────
+# Upper bound for waits that include pulling images onto a node first:
+#   - a node reporting Ready after it joins (it needs the CNI image)
+#   - the metrics-server rollout
+# On this lab's slow uplink (~300 KB/s) the Cilium image alone took 5.5 min, so
+# the old hardcoded 300s failed k8s-w-0's join ~47 s before the node went Ready.
+# On a fast network these waits still finish in seconds; this only caps them.
+k8s_ready_timeout: "900s"
+
 # ───────────────────────────────  CNI  ──────────────────────────────────────
 cni: "cilium"              # calico | cilium | weavenet
 

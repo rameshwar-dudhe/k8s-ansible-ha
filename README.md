@@ -266,6 +266,7 @@ All set in `inventory/group_vars/all.yml`, overridable with `-e`.
 | `metrics_server_enabled` | `true`, `false` | `true` |
 | `metrics_server_version` | any `kubernetes-sigs/metrics-server` tag | `v0.9.0` |
 | `metrics_server_kubelet_insecure_tls` | `true`, `false` | `true` |
+| `k8s_ready_timeout` | any kubectl duration, e.g. `600s`, `20m` | `900s`; caps node-Ready-after-join and metrics-server rollout waits (slow image pulls) |
 | `kubevip_enabled` | `true`, `false` | `true` |
 | `kubevip_vip` | any free IP | `192.168.56.140` |
 | `kubevip_mode` | `arp`, `bgp` | `arp` |

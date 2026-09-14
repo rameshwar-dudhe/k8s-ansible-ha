@@ -47,11 +47,14 @@
     {{ inventory_hostname }} node-role.kubernetes.io/worker= --overwrite
   changed_when: true
 
+# A fresh node only turns Ready once its CNI image is pulled and running. On a
+# slow uplink that pull alone can exceed 5 min, so the wait is k8s_ready_timeout
+# (group_vars), not a hardcoded 300s.
 - name: join-worker | Wait for the node to report Ready
   delegate_to: "{{ groups['master_primary'][0] }}"
   ansible.builtin.command: >-
     kubectl --kubeconfig /etc/kubernetes/admin.conf wait --for=condition=Ready
-    node/{{ inventory_hostname }} --timeout=300s
+    node/{{ inventory_hostname }} --timeout={{ k8s_ready_timeout }}
   changed_when: false
 
 # ──────────────────────── CNI health on THIS node ──────────────────────────

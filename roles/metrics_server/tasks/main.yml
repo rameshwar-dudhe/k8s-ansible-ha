@@ -51,7 +51,8 @@
 
     - name: metrics-server | Wait for the Deployment rollout
       ansible.builtin.command: >-
-        {{ _kubectl }} -n kube-system rollout status deployment/metrics-server --timeout=300s
+        {{ _kubectl }} -n kube-system rollout status deployment/metrics-server
+        --timeout={{ k8s_ready_timeout }}
       changed_when: false
 
     - name: metrics-server | Wait for the metrics.k8s.io APIService to be Available

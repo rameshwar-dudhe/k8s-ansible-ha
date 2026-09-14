@@ -72,11 +72,12 @@
   vars:
     kubevip_kubeconfig: /etc/kubernetes/admin.conf
 
+# Same slow-image-pull exposure as a worker join: see k8s_ready_timeout in group_vars.
 - name: join-master | Wait for the node to report Ready
   delegate_to: "{{ groups['master_primary'][0] }}"
   ansible.builtin.command: >-
     kubectl --kubeconfig /etc/kubernetes/admin.conf wait --for=condition=Ready
-    node/{{ inventory_hostname }} --timeout=300s
+    node/{{ inventory_hostname }} --timeout={{ k8s_ready_timeout }}
   changed_when: false
 
 - name: join-master | Confirm etcd quorum

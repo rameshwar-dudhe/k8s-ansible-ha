@@ -4,8 +4,9 @@
     TASK 93 [control_plane_init : init | Run kubeadm init]   <- numbered
 
 Enabled in ansible.cfg (`stdout_callback = numbered`). Everything else —
-result_format=yaml, display_skipped_hosts, colours, the recap — is the default
-callback unchanged, because this subclasses it and only touches the banner text.
+callback_result_format=yaml, display_skipped_hosts, colours, the recap — is the
+default callback unchanged, because this subclasses it and only touches the
+banner text.
 """
 
 from __future__ import annotations
