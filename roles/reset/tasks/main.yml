@@ -293,11 +293,17 @@
     - /var/lib/containers
 
 - name: reset | Start the container runtime with a clean data store
+  # Skipped under the package purge: the runtime is about to be removed, and
+  # starting it would only re-initialise an empty storage skeleton
+  # (/var/lib/containers/storage lock files + index) that nothing wipes
+  # afterwards, so the node would not really end up as a bare OS.
+  #
   # No systemd unit to start is a legitimate state here, not a failure -- e.g.
   # a prior purge removed the runtime entirely, or a runtime switch (cri=X ->
   # cri=Y) never got past a failed package install. Either way there's
   # nothing running to leave dirty, and the container_runtime role installs
   # and starts the runtime fresh on the next create-cluster.yml regardless.
+  when: not (reset_purge_packages | bool)
   ansible.builtin.systemd_service:
     name: "{{ 'crio' if 'crio' in _reset_cri_socket else 'containerd' }}"
     state: started
@@ -372,7 +378,8 @@
         - /etc/crictl.yaml
         - /usr/local/bin/cilium
         # /var/lib/containerd and /var/lib/containers are already wiped
-        # unconditionally earlier in this role, regardless of this flag.
+        # unconditionally earlier in this role, regardless of this flag, and
+        # stay gone because the runtime is not restarted under the purge.
 
 - name: reset | Done
   ansible.builtin.debug:
