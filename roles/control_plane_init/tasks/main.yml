@@ -221,6 +221,89 @@
     regexp: 'server:\s*https://\S+'
     replace: "server: https://{{ control_plane_endpoint }}:{{ control_plane_port }}"
 
+# ───────────── Install the fresh kubeconfig for local users ───────────────
+# A rebuild mints a new cluster CA, so a ~/.kube/config left over from the
+# previous cluster makes kubectl/k9s fail with "x509: certificate signed by
+# unknown authority". Copy artifacts/admin.conf into place for every user in
+# kubeconfig_local_users. `backup: true` keeps the old file when content differs,
+# and an identical file is left alone, so re-runs stay unchanged.
+#
+# Under ansible-navigator, "localhost" is the execution-environment container:
+# the host's home directories are not there (and neither is the claude user).
+# Detect that and skip with a message instead of writing into the container.
+- name: init | Detect whether Ansible runs inside a container (ansible-navigator EE)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.stat:
+    path: /.dockerenv
+  register: _local_dockerenv
+
+- name: init | Decide whether to install local kubeconfigs
+  ansible.builtin.set_fact:
+    _kubeconfig_in_container: >-
+      {{ _local_dockerenv.stat.exists
+         or (lookup('ansible.builtin.env', 'container') | length > 0) }}
+
+- name: init | Install admin.conf as ~/.kube/config for local users
+  when:
+    - kubeconfig_local_users | default([]) | length > 0
+    - not (_kubeconfig_in_container | bool)
+  block:
+    # getent exits 2 when the user does not exist; that is a skip, not a failure.
+    - name: init | Look up each local user's home directory
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: getent passwd {{ item }}
+      loop: "{{ kubeconfig_local_users }}"
+      register: _kubeconfig_passwd
+      changed_when: false
+      failed_when: _kubeconfig_passwd.rc not in [0, 2]
+
+    - name: init | Create ~/.kube for each local user
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: "{{ item.stdout.split(':')[5] }}/.kube"
+        state: directory
+        owner: "{{ item.item }}"
+        group: "{{ item.stdout.split(':')[3] }}"
+        mode: "0700"
+      loop: "{{ _kubeconfig_passwd.results | selectattr('rc', 'equalto', 0) | list }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: init | Copy admin.conf to ~/.kube/config (old file backed up if different)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        src: "{{ artifacts_dir }}/admin.conf"
+        dest: "{{ item.stdout.split(':')[5] }}/.kube/config"
+        owner: "{{ item.item }}"
+        group: "{{ item.stdout.split(':')[3] }}"
+        mode: "0600"
+        backup: true
+      loop: "{{ _kubeconfig_passwd.results | selectattr('rc', 'equalto', 0) | list }}"
+      loop_control:
+        label: "{{ item.item }} -> {{ item.stdout.split(':')[5] }}/.kube/config"
+
+    - name: init | Note local users that do not exist on this machine
+      when: _kubeconfig_passwd.results | selectattr('rc', 'equalto', 2) | list | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          Skipped kubeconfig for users not present on the control node:
+          {{ _kubeconfig_passwd.results | selectattr('rc', 'equalto', 2)
+             | map(attribute='item') | join(', ') }}
+
+- name: init | Explain why ~/.kube/config was not updated
+  when:
+    - kubeconfig_local_users | default([]) | length > 0
+    - _kubeconfig_in_container | bool
+  ansible.builtin.debug:
+    msg: >-
+      Running inside a container (ansible-navigator execution environment), so
+      ~/.kube/config on the host was NOT updated. On the host run:
+      install -m 600 {{ artifacts_dir }}/admin.conf ~/.kube/config
+
 - name: init | Store the join commands on the control node
   delegate_to: localhost
   become: false

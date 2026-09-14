@@ -146,9 +146,19 @@ cd /root/k8s-ansible-ha
 ansible-playbook playbooks/preflight.yml            # read-only sanity check
 ansible-playbook playbooks/create-cluster.yml       # build it
 
-export KUBECONFIG=$PWD/artifacts/admin.conf
-kubectl get nodes -o wide
+kubectl get nodes -o wide     # works right away, see below
 ```
+
+The build installs `artifacts/admin.conf` as `~/.kube/config` for every user in
+`kubeconfig_local_users` (default `root` and `claude`), so `kubectl` and `k9s`
+talk to the new cluster without extra steps. A rebuild mints a new cluster CA,
+and the old config would fail with `x509: certificate signed by unknown
+authority`. If the existing file is different, it is backed up first as
+`config.<pid>.<date>@<time>~`, Ansible's backup naming.
+
+This step is skipped under `ansible-navigator`, whose container can't see the
+host's home directories. After a navigator run, do it by hand:
+`install -m 600 artifacts/admin.conf ~/.kube/config`.
 
 ### Task numbers in the output
 
@@ -271,6 +281,7 @@ All set in `inventory/group_vars/all.yml`, overridable with `-e`.
 | `helm_version` | any helm release tag | `v3.21.3` |
 | `metrics_server_kubelet_insecure_tls` | `true`, `false` | `true` |
 | `k8s_ready_timeout` | any kubectl duration, e.g. `600s`, `20m` | `900s`; caps node-Ready-after-join and metrics-server rollout waits (slow image pulls) |
+| `kubeconfig_local_users` | list of local user names, or `[]` to disable | `["root", "claude"]`; each gets `artifacts/admin.conf` as `~/.kube/config` after a build, with a backup if the old file differs |
 | `kubevip_enabled` | `true`, `false` | `true` |
 | `kubevip_vip` | any free IP | `192.168.56.140` |
 | `kubevip_mode` | `arp`, `bgp` | `arp` |
@@ -484,6 +495,18 @@ ansible-playbook playbooks/destroy-cluster.yml -e confirm_destroy=yes -e reset_p
 
 Refuses to run without `confirm_destroy`. Order is workers → secondary control
 planes → primary, because draining is impossible once the API server is gone.
+
+On the control node, the playbook deletes `artifacts/admin.conf`,
+`artifacts/join-commands.sh` and each `kubeconfig_local_users` user's
+`~/.kube/config`.
+
+- **Only this cluster's kubeconfig is deleted.** The file must hold exactly one
+  cluster, and that cluster's server must be this cluster's endpoint
+  (`https://<VIP>:6443`). A kubeconfig that also carries other clusters, or
+  points somewhere else, is kept and reported.
+- **Backups are never touched:** neither `config.bak-*` nor `config.*~`.
+- **Skipped under `ansible-navigator`.** Its container can't see the host's
+  home directories.
 
 ---
 

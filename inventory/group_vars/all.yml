@@ -229,3 +229,20 @@ firewall_action: "open"
 # ──────────────────────── Local artifacts (control node) ───────────────────
 # admin.conf and join commands are written here, mode 0600.
 artifacts_dir: "{{ inventory_dir }}/../artifacts"
+
+# After every build, also install artifacts/admin.conf as ~/.kube/config for
+# these users on the control node. A rebuild mints a new cluster CA, so a stale
+# ~/.kube/config makes kubectl and k9s fail with
+# "x509: certificate signed by unknown authority".
+# If the existing file differs, it is backed up first, using Ansible's backup
+# naming: config.<pid>.<date>@<time>~.
+# Users that don't exist on this machine are skipped. [] turns this off.
+#
+# destroy-cluster.yml removes these users' ~/.kube/config again, but only if the
+# file holds exactly this one cluster (server = the VIP endpoint). A kubeconfig
+# that also carries other clusters is kept. Backups are never touched.
+#
+# - Needs Ansible to run as root to write into other users' homes.
+# - Skipped when running inside an ansible-navigator execution environment,
+#   because the container can't see the host's home directories.
+kubeconfig_local_users: ["root", "claude"]

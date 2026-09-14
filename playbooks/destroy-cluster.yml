@@ -129,6 +129,102 @@
         - "{{ artifacts_dir }}/admin.conf"
         - "{{ artifacts_dir }}/join-commands.sh"
 
+    # ─────── ~/.kube/config installed by create-cluster.yml for local users ───────
+    # The cluster CA is gone, so a kubeconfig pointing at this cluster is dead
+    # weight: kubectl/k9s would only fail with x509 or connection errors. Remove it,
+    # but ONLY when the file holds exactly one cluster AND that cluster's server is
+    # this cluster's endpoint. A kubeconfig that also carries other clusters, or
+    # points somewhere else, is left untouched and reported. Backups
+    # (config.bak-*, config.*~) are never touched.
+    #
+    # Under ansible-navigator, "localhost" is the execution-environment container,
+    # which cannot see the host's home directories. Skip there with a message.
+    - name: Detect whether Ansible runs inside a container (ansible-navigator EE)
+      ansible.builtin.stat:
+        path: /.dockerenv
+      register: _local_dockerenv
+
+    - name: Decide whether local kubeconfigs can be cleaned up
+      ansible.builtin.set_fact:
+        _kubeconfig_in_container: >-
+          {{ _local_dockerenv.stat.exists
+             or (lookup('ansible.builtin.env', 'container') | length > 0) }}
+        _kubeconfig_this_server: "https://{{ control_plane_endpoint }}:{{ control_plane_port }}"
+
+    - name: Remove local kubeconfigs that point at this cluster
+      when:
+        - kubeconfig_local_users | default([]) | length > 0
+        - not (_kubeconfig_in_container | bool)
+      block:
+        # Read-only lookup, so let it run under --check too. getent exits 2 when
+        # the user does not exist; that is a skip, not a failure.
+        - name: Look up each local user's home directory
+          ansible.builtin.command: getent passwd {{ item }}
+          loop: "{{ kubeconfig_local_users }}"
+          register: _kubeconfig_passwd
+          changed_when: false
+          failed_when: _kubeconfig_passwd.rc not in [0, 2]
+          check_mode: false
+
+        - name: Check which users have a ~/.kube/config
+          ansible.builtin.stat:
+            path: "{{ item.stdout.split(':')[5] }}/.kube/config"
+          loop: "{{ _kubeconfig_passwd.results | selectattr('rc', 'equalto', 0) | list }}"
+          loop_control:
+            label: "{{ item.item }}"
+          register: _kubeconfig_stat
+
+        - name: Read the existing kubeconfigs
+          ansible.builtin.slurp:
+            src: "{{ item.stat.path }}"
+          loop: "{{ _kubeconfig_stat.results | selectattr('stat.exists') | list }}"
+          loop_control:
+            label: "{{ item.item.item }}"
+          register: _kubeconfig_content
+
+        - name: Start with empty remove / keep lists
+          ansible.builtin.set_fact:
+            _kubeconfig_remove: []
+            _kubeconfig_keep: []
+
+        # A kubeconfig is removable only when it holds exactly one cluster and
+        # that cluster's server is this cluster's endpoint. Everything else is kept.
+        - name: Sort each kubeconfig into remove or keep
+          vars:
+            _clusters: "{{ (item.content | b64decode | from_yaml).clusters | default([]) }}"
+            _removable: >-
+              {{ (_clusters | length == 1)
+                 and ((_clusters[0].cluster.server | default('')) == _kubeconfig_this_server) }}
+          ansible.builtin.set_fact:
+            _kubeconfig_remove: "{{ _kubeconfig_remove + ([item.source] if _removable | bool else []) }}"
+            _kubeconfig_keep: "{{ _kubeconfig_keep + ([] if _removable | bool else [item.source]) }}"
+          loop: "{{ _kubeconfig_content.results }}"
+          loop_control:
+            label: "{{ item.source }}"
+
+        - name: Delete kubeconfigs that only point at the destroyed cluster
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: "{{ _kubeconfig_remove }}"
+
+        - name: Report kubeconfigs that were kept
+          when: _kubeconfig_keep | length > 0
+          ansible.builtin.debug:
+            msg: >-
+              Kept (holds other clusters or does not point at {{ _kubeconfig_this_server }}):
+              {{ _kubeconfig_keep | join(', ') }}
+
+    - name: Explain why ~/.kube/config was not cleaned up
+      when:
+        - kubeconfig_local_users | default([]) | length > 0
+        - _kubeconfig_in_container | bool
+      ansible.builtin.debug:
+        msg: >-
+          Running inside a container (ansible-navigator execution environment), so
+          ~/.kube/config on the host was NOT removed. If it points at this cluster,
+          delete it on the host: rm ~/.kube/config
+
     - name: Done
       ansible.builtin.debug:
         msg: >-
