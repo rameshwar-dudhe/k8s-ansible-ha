@@ -41,8 +41,15 @@ artifacts/
 *.retry
 *.log
 
+# ansible-navigator: playbook artifacts replay every task's output — join
+# tokens, certificate keys, kubectl output — so they are as secret as artifacts/.
+navigator-artifacts/
+
 # ── Local tooling ──────────────────────────────────────────────────────────
 .claude/settings.local.json
+.venv/
+__pycache__/
+*.pyc
 
 # ── Editor / OS noise ──────────────────────────────────────────────────────
 *.swp

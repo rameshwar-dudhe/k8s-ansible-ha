@@ -1,0 +1,9 @@
+# Control-node tooling, installed into a project venv (system pip is PEP 668
+# locked on Ubuntu):
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-dev.txt
+#
+# The playbooks themselves run inside the execution-environment image pinned in
+# ansible-navigator.yml, not against the ansible-core this pulls into the venv.
+ansible-navigator==26.8.0

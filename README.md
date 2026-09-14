@@ -70,6 +70,8 @@ The forbidden list lives in `inventory/group_vars/all.yml` as `forbidden_hosts`.
 
 ```
 ansible.cfg
+ansible-navigator.yml       # navigator settings: pinned EE image, stdout mode, artifacts
+requirements-dev.txt        # control-node tooling (ansible-navigator) for .venv
 inventory/
   hosts.yml                 # ONLY 192.168.56.134
   group_vars/all.yml        # every tunable
@@ -89,6 +91,7 @@ roles/
   kubevip/  control_plane_init/  gateway_api/  cni/
   join_control_plane/  join_worker/  metrics_server/  reset/
 artifacts/                  # admin.conf + join commands (mode 0600), created at run time
+navigator-artifacts/        # navigator log + playbook replay files (git-ignored, secret)
 ```
 
 ---
@@ -146,6 +149,102 @@ ansible-playbook playbooks/create-cluster.yml       # build it
 export KUBECONFIG=$PWD/artifacts/admin.conf
 kubectl get nodes -o wide
 ```
+
+### Task numbers in the output
+
+Every task banner carries a running number, so you can tell exactly where a
+manual run is and quote a task by number:
+
+```
+TASK 93 [control_plane_init : init | Run kubeadm init] ***********************
+changed: [k8s-cp-0]
+...
+RUNNING HANDLER 12 [container_runtime : restart crio] ************************
+```
+
+This comes from `callback_plugins/numbered.py`, enabled in `ansible.cfg` as
+`stdout_callback = numbered`. It is the built-in `default` callback with a
+counter added, so the output is otherwise unchanged.
+
+- Numbers count only banners that are actually printed. With
+  `display_skipped_hosts = False`, a task skipped on every host shows no banner
+  and takes no number, so the sequence has no gaps.
+- `include_tasks` counts once, then each included task gets its own number.
+  A loop is one number, however many items it has.
+- A task that runs on several hosts at once is still one number.
+- To see the full plan up front: `ansible-playbook --list-tasks playbooks/create-cluster.yml`.
+- To turn numbering off for one run: `ANSIBLE_STDOUT_CALLBACK=default ansible-playbook ...`.
+  To turn it off for good, set `stdout_callback = default` in `ansible.cfg`.
+- Under `ansible-navigator run`, ansible-runner replaces the stdout callback with
+  its own `awx_display`, so navigator output has no task numbers. Navigator still
+  works normally.
+
+---
+
+## Running with ansible-navigator
+
+Every playbook can also run through
+[ansible-navigator](https://ansible.readthedocs.io/projects/navigator/). By
+default it runs inside a pinned **execution environment** (EE) container, so
+ansible-core and collection versions are fixed by the image, not by whatever is
+installed on the control node. `ansible-navigator.yml` in the repo root is
+picked up automatically.
+
+**One-time setup** (system pip is PEP 668-locked on Ubuntu, so use a venv):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt     # ansible-navigator 26.8.0
+sudo systemctl enable --now docker                # the EE container engine
+```
+
+**Run** — the same playbooks, `ansible-navigator run` instead of `ansible-playbook`:
+
+```bash
+.venv/bin/ansible-navigator run playbooks/preflight.yml
+.venv/bin/ansible-navigator run playbooks/create-cluster.yml
+.venv/bin/ansible-navigator run playbooks/metrics-server.yml -e metrics_server_enabled=false
+.venv/bin/ansible-navigator run playbooks/destroy-cluster.yml -e confirm_destroy=yes
+
+.venv/bin/ansible-navigator exec -- ansible k8s_cluster -m ping    # ad-hoc, inside the EE
+.venv/bin/ansible-navigator run playbooks/preflight.yml -m interactive   # TUI
+```
+
+What `ansible-navigator.yml` sets:
+
+| Setting | Value | Why |
+|---|---|---|
+| `execution-environment.image` | `ghcr.io/ansible/community-ansible-dev-tools:v26.8.0` | pinned tag, never `:latest` |
+| `execution-environment.container-engine` | `docker` | only Docker is installed here |
+| `execution-environment.container-options` | `--net=host` | nodes and the VIP are reached exactly as from the host, no bridge NAT |
+| `ansible.config.path` | `./ansible.cfg` | same inventory, roles, forks and SSH options as `ansible-playbook` |
+| `mode` | `stdout` | plain playbook output; `-m interactive` for the TUI |
+| `playbook-artifact.save-as` | `navigator-artifacts/<playbook>-<status>-<time>.json` | replay with `ansible-navigator replay <file>` |
+
+No volume mounts are needed. Navigator mounts the project directory at the same
+path, so `artifacts/admin.conf` written by `delegate_to: localhost` tasks lands
+in the real repo. ansible-runner mounts `$HOME/.ssh/` into the container, so the
+node SSH key works.
+
+**`navigator-artifacts/` is secret.** A replay file records every task's
+output, including kubeadm join tokens and certificate keys. It is git-ignored
+like `artifacts/`.
+
+**Without the container:** add `--ee false`. Navigator then runs the host's
+`/usr/bin/ansible-playbook` (ansible-core 2.20.1 from the `ansible` apt
+package, with `ansible.utils` for the Calico `ipaddr` filter), **not** the
+ansible-core that pip pulled into `.venv`.
+
+Verified on 2026-09-14 against the live .137/.138 cluster:
+
+| Run | Result |
+|---|---|
+| `ansible-navigator exec -- ansible k8s_cluster -m ping` (EE) | both nodes `pong` |
+| `ansible-navigator run playbooks/metrics-server.yml` (EE: ansible-core 2.21.3) | `changed=0 failed=0`, `kubectl top nodes` data |
+| `ansible-navigator run playbooks/preflight.yml --ee false` (host ansible-core 2.20.1) | `failed=0` on both nodes |
+
+The EE image is ~2 GB. On this network the first `docker pull` took 21 minutes;
+after that `pull.policy: missing` reuses the local copy.
 
 ---
 

@@ -1,0 +1,57 @@
+---
+# ============================================================================
+#  ansible-navigator settings. Picked up automatically from the repo root.
+#
+#    .venv/bin/ansible-navigator run playbooks/preflight.yml
+#    .venv/bin/ansible-navigator run playbooks/create-cluster.yml
+#    .venv/bin/ansible-navigator exec -- ansible k8s_cluster -m ping
+#
+#  Playbooks run inside a pinned execution-environment (EE) container, so every
+#  run uses the same ansible-core and collections regardless of what is
+#  installed on this machine. Add `--ee false` to run against the host's
+#  ansible instead.
+#
+#  Everything in this file can be overridden per run on the CLI, e.g.
+#  `-m interactive` for the TUI or `--eei <image>` to try another EE.
+# ============================================================================
+ansible-navigator:
+  ansible:
+    config:
+      # Same ansible.cfg as a plain ansible-playbook run: inventory, roles_path,
+      # forks, callback and SSH options all come from here.
+      path: ./ansible.cfg
+
+  execution-environment:
+    enabled: true
+    # Only Docker is installed on this control node (no podman).
+    container-engine: docker
+    # Pinned tag, not :latest, so an upstream image change can't silently
+    # change ansible-core or collection versions under the playbooks.
+    image: ghcr.io/ansible/community-ansible-dev-tools:v26.8.0
+    pull:
+      policy: missing
+    container-options:
+      # Share the host's network namespace: the nodes (192.168.56.0/24) and the
+      # kube-vip VIP are reached exactly as a host-side ansible-playbook would
+      # reach them, with no Docker bridge NAT in between.
+      - "--net=host"
+    # No volume-mounts needed:
+    #   - the project directory is mounted at the same path by navigator, so
+    #     artifacts/admin.conf written by delegate_to: localhost tasks lands in
+    #     the real repo;
+    #   - ansible-runner auto-mounts $HOME/.ssh/ so the node SSH key works.
+
+  # stdout matches plain ansible-playbook output. Use `-m interactive` for the TUI.
+  mode: stdout
+
+  playbook-artifact:
+    enable: true
+    # Replay later with: ansible-navigator replay navigator-artifacts/<file>.json
+    # These contain every task's output (join tokens, certificate keys), so the
+    # directory is git-ignored, like artifacts/.
+    save-as: "{playbook_dir}/../navigator-artifacts/{playbook_name}-{playbook_status}-{time_stamp}.json"
+
+  logging:
+    level: warning
+    append: true
+    file: navigator-artifacts/ansible-navigator.log
