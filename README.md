@@ -1,6 +1,6 @@
 # k8s-ansible-ha
 
-Ansible automation for a **highly-available Kubernetes 1.36** cluster with
+Ansible automation for a **highly-available Kubernetes 1.37** cluster with
 **kube-vip**, selectable **CNI**, selectable **container runtime**, and support
 for **Ubuntu / RHEL / Rocky**.
 
@@ -13,7 +13,7 @@ Requires **ansible-core only** — no Galaxy collections.
 | Layer | What | Version(s) |
 |---|---|---|
 | Orchestration | Ansible | ansible-core only, no Galaxy collections |
-| Kubernetes | kubeadm-built HA cluster | **v1.36** (`k8s_minor`, patch pinnable) |
+| Kubernetes | kubeadm-built HA cluster | **v1.37** (`k8s_minor`, patch pinnable) |
 | Load balancer (control-plane VIP) | **kube-vip** | **v1.2.3**, ARP or BGP mode |
 | CNI (selectable) | Calico | **v3.32.1** (tigera-operator) |
 | | Cilium | **1.20.0** (CLI v0.19.7) |
@@ -385,7 +385,7 @@ and the reason is recorded here.
 
 **Matches upstream exactly**
 
-- kubeadm install: `pkgs.k8s.io/core:/stable:/v1.36/{deb,rpm}` repo URLs, keyring
+- kubeadm install: `pkgs.k8s.io/core:/stable:/v1.37/{deb,rpm}` repo URLs, keyring
   handling, `apt-mark hold` / dnf `exclude`, cgroup driver `systemd`.
 - containerd: upstream explicitly warns that a packaged install may leave `cri`
   in `disabled_plugins` and says to reset with
@@ -516,7 +516,7 @@ renaming, controlled by `apt_disable_cdrom_sources`.
 **Weave Net is archived.** Weaveworks ceased trading and
 `weaveworks/weave` has had no release since 2024. `cni=weavenet` installs the
 community fork `rajch/weave v2.9.0`, whose newest manifest still targets the
-"k8s-1.11" schema. It is **not** validated against Kubernetes 1.36 and the role
+"k8s-1.11" schema. It is **not** validated against Kubernetes 1.37 and the role
 warns loudly. Use `calico` or `cilium` for anything real.
 
 **The control-plane taint does not block system add-ons.** CoreDNS, Calico and
